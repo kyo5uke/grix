@@ -62,4 +62,9 @@ jobs:
         run: |
           # The create can race across matrix jobs; the loser just uploads.
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber --repo "$GITHUB_REPOSITORY"
+          # Creation by a sibling job may still be in flight: retry the upload.
+          for i in 1 2 3 4 5; do
+            gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber --repo "$GITHUB_REPOSITORY" && exit 0
+            sleep 10
+          done
+          exit 1
