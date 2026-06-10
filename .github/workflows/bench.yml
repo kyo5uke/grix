@@ -1,0 +1,32 @@
+name: bench
+
+# Manual benchmark on a stock Linux runner, against the linux kernel source.
+# Results land in the public job log so they can be linked directly.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install ripgrep + hyperfine
+        run: sudo apt-get update && sudo apt-get install -y ripgrep hyperfine
+      - name: Build grix (release)
+        run: cargo build --release
+      - name: Fetch corpus (linux kernel source)
+        run: |
+          curl -sL -o /tmp/linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.tar.xz
+          mkdir -p /tmp/corpus
+          tar -xf /tmp/linux.tar.xz -C /tmp/corpus
+      - name: Versions
+        run: |
+          rg --version | head -1
+          hyperfine --version
+          ./target/release/grix --version
+          nproc
+      - name: Run benchmark
+        run: |
+          GRIX="$PWD/target/release/grix" RUNS=10 bash bench/run.sh /tmp/corpus/linux-6.12
