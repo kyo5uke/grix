@@ -30,7 +30,7 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
-            max_file_size: 4 << 20,
+            max_file_size: 16 << 20,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
