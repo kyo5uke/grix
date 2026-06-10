@@ -1,9 +1,4 @@
-mod index;
-mod plan;
-mod search;
-mod store;
-mod trigram;
-mod varint;
+use grix::{index, search, store};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};

@@ -5,6 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub fn data_dir() -> io::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("GRIX_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
     #[cfg(windows)]
     {
         if let Some(base) = std::env::var_os("LOCALAPPDATA") {
