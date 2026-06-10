@@ -1,0 +1,26 @@
+[package]
+name = "grix"
+version = "0.1.0"
+edition = "2021"
+authors = ["kyosuke <h.kyosuke0505@gmail.com>"]
+description = "grep with an index: trigram-indexed code search that answers in milliseconds"
+repository = "https://github.com/kyo5uke/grix"
+license = "MIT"
+keywords = ["grep", "search", "index", "trigram", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+rust-version = "1.74"
+
+[dependencies]
+regex = "1"
+regex-syntax = "0.8"
+memmap2 = "0.9"
+ignore = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tempfile = "3"
