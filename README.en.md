@@ -67,9 +67,18 @@ pattern is parity-checked (identical matched-line counts) before timing.
 
 Index: 162 MiB, built once in ~26 s (≈90 s with a cold filesystem cache);
 a refresh when nothing changed takes ~2.4 s and re-reads no file contents.
-Note these timings are from Windows, where directory walks are expensive —
-on Linux ripgrep's full scans are faster, so expect a smaller (but still
-large) gap.
+
+Directory walks are expensive on Windows, so the same comparison on Linux
+(stock GitHub Actions runner, 4 cores — [public log](https://github.com/kyo5uke/grix/actions/runs/27286573555))
+is tighter but still decisive:
+
+| pattern | ripgrep | grix | speedup |
+|---|---:|---:|---:|
+| `PageTransHuge` (rare literal) | 338 ms | 7.6 ms | 44.6× |
+| `EXPORT_SYMBOL` (common literal) | 355 ms | 63 ms | 5.6× |
+| `static\s+int\s+\w+_probe` (regex) | 390 ms | 99 ms | 4.0× |
+| `spinlock` (`-i`) | 409 ms | 71 ms | 5.8× |
+| `zzqqxx_does_not_exist` (no match) | 335 ms | 7.6 ms | 44.0× |
 
 ## How it works
 
