@@ -227,6 +227,12 @@ pub fn scan_buffer(
     let mut cur_line: Option<(usize, usize)> = None; // (start, end) of last line emitted
 
     for m in re.find_iter(data) {
+        // grep/ripgrep search line by line: a match can never span a
+        // newline. Enforce the same semantics for output parity (e.g. \s+
+        // would otherwise bridge lines).
+        if memchr::memchr(b'\n', &data[m.start()..m.end()]).is_some() {
+            continue;
+        }
         if matches_only {
             // Existence is all the caller needs.
             lines.push(MatchLine {
@@ -491,6 +497,18 @@ mod tests {
         let lines = scan_buffer(&re("^abc$"), data, false, None);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].line_number, 2);
+    }
+
+    #[test]
+    fn matches_never_span_lines() {
+        // ripgrep semantics: \s+ must not bridge a newline.
+        let data = b"static\nint x;\nstatic int y;\n";
+        let lines = scan_buffer(&re(r"static\s+int"), data, false, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_number, 3);
+        // Explicit \n in the pattern can match nothing, ever.
+        assert!(scan_buffer(&re("static\\nint"), data, false, None).is_empty());
+        assert!(scan_buffer(&re("static\\nint"), data, true, None).is_empty());
     }
 
     #[test]

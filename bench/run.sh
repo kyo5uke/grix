@@ -19,6 +19,16 @@ RUNS=${RUNS:-10}
 command -v hyperfine >/dev/null || { echo "error: hyperfine not found" >&2; exit 1; }
 command -v "$RG" >/dev/null || { echo "error: ripgrep not found" >&2; exit 1; }
 
+# hyperfine runs with --shell=none, so binaries need plain native paths
+# (and forward slashes survive its argument splitting on Windows).
+if command -v cygpath >/dev/null; then
+  GRIX_CMD=$(cygpath -m "$(command -v "$GRIX")")
+  RG_CMD=$(cygpath -m "$(command -v "$RG")")
+else
+  GRIX_CMD=$GRIX
+  RG_CMD=$RG
+fi
+
 cd "$CORPUS"
 
 echo "## corpus"
@@ -39,6 +49,8 @@ echo "- refresh (no changes): $(( (end - start) / 1000000 )) ms"
 echo
 
 # pattern | flags (applied to both tools) | description
+# NOTE: patterns must not contain spaces or '|' (hyperfine -N word splitting
+# / the field separator below).
 benchmarks=(
   'PageTransHuge||rare literal'
   'EXPORT_SYMBOL||common literal (tens of thousands of hits)'
@@ -60,8 +72,8 @@ for spec in "${benchmarks[@]}"; do
   fi
   echo "- matched lines (both tools): $rg_count"
 
-  hyperfine --warmup 3 --runs "$RUNS" --ignore-failure --style basic \
-    -n "rg" "$RG $flags '$pattern' --no-heading" \
-    -n "grix" "$GRIX $flags '$pattern' . --no-heading --color never"
+  hyperfine --warmup 3 --runs "$RUNS" --shell=none --ignore-failure --style basic \
+    -n "rg" "$RG_CMD $flags '$pattern' --no-heading" \
+    -n "grix" "$GRIX_CMD $flags '$pattern' . --no-heading --color never"
   echo
 done
