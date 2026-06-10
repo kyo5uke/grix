@@ -27,7 +27,11 @@ fn write(root: &Path, rel: &str, content: &[u8]) {
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    write(&root, "src/main.rs", b"fn main() {\n    println!(\"hello grix\");\n}\n");
+    write(
+        &root,
+        "src/main.rs",
+        b"fn main() {\n    println!(\"hello grix\");\n}\n",
+    );
     write(
         &root,
         "src/lib.rs",
@@ -38,8 +42,16 @@ fn fixture() -> Fixture {
         "docs/guide.md",
         b"Searching with foo and bar.\nfoo bar baz\nFOO IN CAPS\n",
     );
-    write(&root, "data/crlf.txt", b"alpha foo\r\nbeta\r\nfoo gamma\r\n");
-    write(&root, "data/unicode.txt", "日本語のテスト foo 行\nfooの行\n".as_bytes());
+    write(
+        &root,
+        "data/crlf.txt",
+        b"alpha foo\r\nbeta\r\nfoo gamma\r\n",
+    );
+    write(
+        &root,
+        "data/unicode.txt",
+        "日本語のテスト foo 行\nfooの行\n".as_bytes(),
+    );
     write(&root, "data/binary.bin", b"\x00\x01\x02foo\x00bar");
     write(&root, "deep/a/b/c/needle.txt", b"the deep needle foo\n");
     // Large file: exceeds the tiny test cap -> scan-always path.
@@ -91,7 +103,7 @@ fn index_search_equals_full_scan() {
     let patterns: &[(&str, bool)] = &[
         ("foo", false),
         ("foo", true),
-        ("fo", false),         // too short: plan must degrade to ALL, not break
+        ("fo", false), // too short: plan must degrade to ALL, not break
         ("f.o", false),
         ("foo|bar", false),
         ("FOO", false),
@@ -156,7 +168,11 @@ fn incremental_update_reflects_edits() {
     let opts = SearchOptions::default();
 
     // New file + modified file + deleted file.
-    write(&fx.root, "src/new_module.rs", b"const SENTINEL_XYZQ: u32 = 1;\n");
+    write(
+        &fx.root,
+        "src/new_module.rs",
+        b"const SENTINEL_XYZQ: u32 = 1;\n",
+    );
     // Force a different mtime even on coarse filesystems.
     std::thread::sleep(std::time::Duration::from_millis(20));
     write(
@@ -225,9 +241,17 @@ fn binary_smoke_exit_codes() {
 
     // First search auto-indexes and finds matches -> exit 0.
     let out = run(&["foo", ".", "--color", "never"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("hello grix") || stdout.contains("foo"), "{stdout}");
+    assert!(
+        stdout.contains("hello grix") || stdout.contains("foo"),
+        "{stdout}"
+    );
 
     // No match -> exit 1.
     let out = run(&["qqqqqq_nothing", ".", "--color", "never"]);

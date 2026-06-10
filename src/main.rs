@@ -393,8 +393,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
 
     let t0 = Instant::now();
     let (results, stats) = if cli.no_index {
-        let root = store::canonical_root(&search_path)
-            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        let root =
+            store::canonical_root(&search_path).map_err(|e| format!("cannot resolve path: {e}"))?;
         search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
     } else {
         // Find (or build) an index that covers the search path.
@@ -438,8 +438,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
             }
         };
         // Search path below the indexed root becomes a path prefix filter.
-        let canon = store::canonical_root(&search_path)
-            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        let canon =
+            store::canonical_root(&search_path).map_err(|e| format!("cannot resolve path: {e}"))?;
         let mut opts = opts.clone();
         if canon != root {
             if let Ok(rel) = canon.strip_prefix(&root) {

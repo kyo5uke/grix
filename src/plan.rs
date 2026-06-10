@@ -282,9 +282,7 @@ impl Info {
     fn simplify(&mut self, force: bool) {
         if let Some(exact) = &self.exact {
             let ml = min_len(exact);
-            if !exact.is_empty()
-                && (exact.len() > MAX_EXACT || (ml >= 3 && force) || ml >= 4)
-            {
+            if !exact.is_empty() && (exact.len() > MAX_EXACT || (ml >= 3 && force) || ml >= 4) {
                 self.add_exact();
                 let exact = self.exact.take().unwrap();
                 for s in exact {
@@ -308,7 +306,11 @@ impl Info {
     /// Capture the trigram information of prefix/suffix, then shorten the
     /// set so later compositions stay bounded.
     fn simplify_set(&mut self, is_suffix: bool) {
-        let set = if is_suffix { &self.suffix } else { &self.prefix };
+        let set = if is_suffix {
+            &self.suffix
+        } else {
+            &self.prefix
+        };
         self.query = std::mem::replace(&mut self.query, Query::All).and(or_trigrams(set));
 
         let set = if is_suffix {
@@ -580,7 +582,10 @@ mod tests {
     #[test]
     fn alternations() {
         assert_eq!(q("abc|def"), r#"("abc"|"def")"#);
-        assert_eq!(q("abcdef|ghijkl"), r#"("abc" "bcd" "cde" "def"|"ghi" "hij" "ijk" "jkl")"#);
+        assert_eq!(
+            q("abcdef|ghijkl"),
+            r#"("abc" "bcd" "cde" "def"|"ghi" "hij" "ijk" "jkl")"#
+        );
         // One branch unconstrained poisons the whole alternation -> ALL.
         assert_eq!(q("abc|a"), "ALL");
     }

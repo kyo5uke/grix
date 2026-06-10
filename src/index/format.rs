@@ -178,7 +178,6 @@ pub struct IndexReader {
     paths_off: usize,
     tri_table_off: usize,
     postings_off: usize,
-    postings_len: usize,
     root_range: (usize, usize),
 }
 
@@ -198,12 +197,10 @@ impl IndexReader {
         if buf.len() < HEADER_LEN || &buf[..8] != MAGIC {
             return Err(IndexError::Corrupt("bad magic"));
         }
-        let u32_at = |off: usize| -> u32 {
-            u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
-        };
-        let u64_at = |off: usize| -> u64 {
-            u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-        };
+        let u32_at =
+            |off: usize| -> u32 { u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) };
+        let u64_at =
+            |off: usize| -> u64 { u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) };
         let version = u32_at(8);
         if version != VERSION {
             return Err(IndexError::WrongVersion(version));
@@ -231,12 +228,16 @@ impl IndexReader {
         need(paths_off, paths_len, "paths out of bounds")?;
         need(
             file_table_off,
-            file_count.checked_mul(28).ok_or(IndexError::Corrupt("file table overflow"))?,
+            file_count
+                .checked_mul(28)
+                .ok_or(IndexError::Corrupt("file table overflow"))?,
             "file table out of bounds",
         )?;
         need(
             tri_table_off,
-            tri_count.checked_mul(16).ok_or(IndexError::Corrupt("tri table overflow"))?,
+            tri_count
+                .checked_mul(16)
+                .ok_or(IndexError::Corrupt("tri table overflow"))?,
             "tri table out of bounds",
         )?;
         need(postings_off, postings_len, "postings out of bounds")?;
@@ -251,7 +252,6 @@ impl IndexReader {
             paths_off,
             tri_table_off,
             postings_off,
-            postings_len,
             root_range: (root_off, root_len),
         })
     }
@@ -325,9 +325,7 @@ impl IndexReader {
     }
 
     /// Iterate (key, decoded ids) over every trigram, for incremental merges.
-    pub fn iter_postings(
-        &self,
-    ) -> impl Iterator<Item = Result<(u32, Vec<u32>), IndexError>> + '_ {
+    pub fn iter_postings(&self) -> impl Iterator<Item = Result<(u32, Vec<u32>), IndexError>> + '_ {
         let buf = self.buf();
         (0..self.tri_count).map(move |i| {
             let e = self.tri_table_off + i * 16;
@@ -416,7 +414,10 @@ mod tests {
             r.postings(crate::trigram::pack_str(b"zzz")).unwrap(),
             vec![0, 1, 2]
         );
-        assert!(r.postings(crate::trigram::pack_str(b"qqq")).unwrap().is_empty());
+        assert!(r
+            .postings(crate::trigram::pack_str(b"qqq"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

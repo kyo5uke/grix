@@ -71,7 +71,7 @@ fn collect_candidates(root: &Path) -> io::Result<Vec<Candidate>> {
             Ok(e) => e,
             Err(_) => continue, // unreadable entries are skipped, not fatal
         };
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let md = match entry.metadata() {
@@ -222,7 +222,8 @@ pub fn build(
 
     // Parallel extraction of changed/new files.
     let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<(u32, Extracted, u64)>> = Mutex::new(Vec::with_capacity(to_extract.len()));
+    let results: Mutex<Vec<(u32, Extracted, u64)>> =
+        Mutex::new(Vec::with_capacity(to_extract.len()));
     let nthreads = opts.threads.max(1).min(to_extract.len().max(1));
     std::thread::scope(|s| {
         for _ in 0..nthreads {
@@ -268,7 +269,10 @@ pub fn build(
         }
     }
     stats.files_indexed = records.iter().filter(|r| r.flags == 0).count();
-    stats.files_binary = records.iter().filter(|r| r.flags & FLAG_BINARY != 0).count();
+    stats.files_binary = records
+        .iter()
+        .filter(|r| r.flags & FLAG_BINARY != 0)
+        .count();
     stats.files_scan_always = records
         .iter()
         .filter(|r| r.flags & FLAG_SCAN_ALWAYS != 0)

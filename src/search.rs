@@ -247,8 +247,7 @@ pub fn scan_buffer(
         counted_to = start;
 
         let line_start = line_anchor;
-        let line_end = memchr::memchr(b'\n', &data[start..])
-            .map_or(data.len(), |p| start + p);
+        let line_end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
 
         if cur_line == Some((line_start, line_end)) {
             // Another match on the same line: extend spans.
@@ -388,7 +387,7 @@ pub fn search_walk(
     let mut targets: Vec<(u32, String, u64)> = Vec::new();
     let walker = ignore::WalkBuilder::new(root).build();
     for entry in walker.flatten() {
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
