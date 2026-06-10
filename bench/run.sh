@@ -68,6 +68,10 @@ for spec in "${benchmarks[@]}"; do
   grix_count=$("$GRIX" $flags "$pattern" . --no-heading --color never 2>/dev/null | wc -l | tr -d ' ' || true)
   if [ "$rg_count" != "$grix_count" ]; then
     echo "PARITY FAILURE: rg=$rg_count grix=$grix_count -- skipping timing" >&2
+    echo "--- rg debug ---" >&2
+    "$RG" $flags "$pattern" --no-heading 2>&1 | head -5 >&2 || true
+    echo "--- grix debug ---" >&2
+    "$GRIX" $flags "$pattern" . --no-heading --color never --stats 2>&1 | tail -8 >&2 || true
     exit 1
   fi
   echo "- matched lines (both tools): $rg_count"

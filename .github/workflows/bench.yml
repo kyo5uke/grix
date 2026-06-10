@@ -27,6 +27,11 @@ jobs:
           hyperfine --version
           ./target/release/grix --version
           nproc
+      - name: Sanity check rg on the corpus
+        run: |
+          cd /tmp/corpus/linux-6.12
+          echo "files: $(rg --files | wc -l)"
+          rg -l PageTransHuge | head -3; echo "rg exit: $?"
       - name: Run benchmark
         run: |
           GRIX="$PWD/target/release/grix" RUNS=10 bash bench/run.sh /tmp/corpus/linux-6.12
