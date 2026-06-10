@@ -15,6 +15,7 @@ regex = "1"
 regex-syntax = "0.8"
 memmap2 = "0.9"
 ignore = "0.4"
+memchr = "2"
 
 [profile.release]
 lto = true

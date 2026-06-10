@@ -123,6 +123,7 @@ name = "grix"
 version = "0.1.0"
 dependencies = [
  "ignore",
+ "memchr",
  "memmap2",
  "regex",
  "regex-syntax",

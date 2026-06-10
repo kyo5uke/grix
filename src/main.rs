@@ -1,10 +1,529 @@
 mod index;
 mod plan;
+mod search;
+mod store;
 mod trigram;
 mod varint;
 
-fn main() {
-    // CLI lands in a later commit; modules first.
-    eprintln!("grix: not wired up yet");
-    std::process::exit(2);
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use index::build::{self, BuildOptions};
+use index::format::IndexReader;
+use search::{FileResult, Matcher, SearchOptions};
+
+const USAGE: &str = "\
+grix - grep with an index
+
+USAGE:
+    grix [OPTIONS] <PATTERN> [PATH]    search (auto-indexes on first run)
+    grix index [PATH]                  build or refresh the index
+    grix status [PATH]                 show index info
+    grix forget [PATH]                 delete the index
+
+OPTIONS:
+    -i              case-insensitive search
+    -F              treat the pattern as a literal string
+    -l              list matching files only
+    -c              print per-file match counts
+    -m <N>          stop after N matching lines per file
+    --json          machine-readable output (one JSON object per line)
+    --stats         print planner/index statistics after searching
+    --explain       print the trigram query plan and exit
+    --no-index      scan without using or building an index
+    --no-auto-index fail instead of building a missing index
+    --no-heading    grep-style path:line:text output
+    --color <WHEN>  always | never | auto (default: auto)
+    -h, --help      show this help
+    -V, --version   show version
+";
+
+struct Cli {
+    pattern: Option<String>,
+    path: Option<PathBuf>,
+    command: Cmd,
+    case_insensitive: bool,
+    fixed: bool,
+    files_only: bool,
+    counts: bool,
+    max_count: Option<u64>,
+    json: bool,
+    stats: bool,
+    explain: bool,
+    no_index: bool,
+    no_auto_index: bool,
+    no_heading: bool,
+    color: ColorChoice,
+}
+
+#[derive(PartialEq)]
+enum Cmd {
+    Search,
+    Index,
+    Status,
+    Forget,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+fn parse_args() -> Result<Cli, String> {
+    let mut cli = Cli {
+        pattern: None,
+        path: None,
+        command: Cmd::Search,
+        case_insensitive: false,
+        fixed: false,
+        files_only: false,
+        counts: false,
+        max_count: None,
+        json: false,
+        stats: false,
+        explain: false,
+        no_index: false,
+        no_auto_index: false,
+        no_heading: false,
+        color: ColorChoice::Auto,
+    };
+    let mut args = std::env::args().skip(1).peekable();
+    let mut positionals: Vec<String> = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("grix {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-i" => cli.case_insensitive = true,
+            "-F" => cli.fixed = true,
+            "-l" => cli.files_only = true,
+            "-c" => cli.counts = true,
+            "-m" => {
+                let v = args.next().ok_or("-m needs a number")?;
+                cli.max_count = Some(v.parse().map_err(|_| format!("bad -m value: {v}"))?);
+            }
+            "--json" => cli.json = true,
+            "--stats" => cli.stats = true,
+            "--explain" => cli.explain = true,
+            "--no-index" => cli.no_index = true,
+            "--no-auto-index" => cli.no_auto_index = true,
+            "--no-heading" => cli.no_heading = true,
+            "--color" => {
+                let v = args.next().ok_or("--color needs always|never|auto")?;
+                cli.color = match v.as_str() {
+                    "always" => ColorChoice::Always,
+                    "never" => ColorChoice::Never,
+                    "auto" => ColorChoice::Auto,
+                    other => return Err(format!("bad --color value: {other}")),
+                };
+            }
+            s if s.starts_with('-') && s.len() > 1 && !positionals.is_empty() => {
+                return Err(format!("unknown option: {s}"));
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("unknown option: {s}"));
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    match positionals.first().map(String::as_str) {
+        Some("index") => {
+            cli.command = Cmd::Index;
+            cli.path = positionals.get(1).map(PathBuf::from);
+        }
+        Some("status") => {
+            cli.command = Cmd::Status;
+            cli.path = positionals.get(1).map(PathBuf::from);
+        }
+        Some("forget") => {
+            cli.command = Cmd::Forget;
+            cli.path = positionals.get(1).map(PathBuf::from);
+        }
+        Some(_) => {
+            cli.pattern = Some(positionals.remove(0));
+            cli.path = positionals.first().map(PathBuf::from);
+        }
+        None => return Err("missing pattern (try --help)".into()),
+    }
+    Ok(cli)
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn human_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn cmd_index(path: Option<&Path>) -> Result<(), String> {
+    let root = store::canonical_root(path.unwrap_or(Path::new(".")))
+        .map_err(|e| format!("cannot resolve path: {e}"))?;
+    let idx = store::index_path(&root).map_err(|e| e.to_string())?;
+    if let Some(parent) = idx.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let old = IndexReader::open(&idx).ok();
+    let t0 = Instant::now();
+    let stats = build::build(&root, &idx, old.as_ref(), &BuildOptions::default())
+        .map_err(|e| format!("index build failed: {e}"))?;
+    let elapsed = t0.elapsed();
+    let size = std::fs::metadata(&idx).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "indexed {} ({} files: {} indexed, {} reused, {} binary, {} too large) in {:.2}s -> {}",
+        root.display(),
+        human_count(stats.files_total),
+        human_count(stats.files_indexed),
+        human_count(stats.files_reused),
+        human_count(stats.files_binary),
+        human_count(stats.files_scan_always),
+        elapsed.as_secs_f64(),
+        human_bytes(size),
+    );
+    Ok(())
+}
+
+fn cmd_status(path: Option<&Path>) -> Result<(), String> {
+    let start = path.unwrap_or(Path::new("."));
+    match store::find_index_upward(start) {
+        Some((idx, root)) => {
+            let reader = IndexReader::open(&idx).map_err(|e| e.to_string())?;
+            let size = std::fs::metadata(&idx).map(|m| m.len()).unwrap_or(0);
+            println!("root:     {}", root.display());
+            println!("index:    {}", idx.display());
+            println!("files:    {}", human_count(reader.file_count()));
+            println!("trigrams: {}", human_count(reader.trigram_count()));
+            println!("size:     {}", human_bytes(size));
+            Ok(())
+        }
+        None => {
+            println!("no index found for {} (run: grix index)", start.display());
+            Ok(())
+        }
+    }
+}
+
+fn cmd_forget(path: Option<&Path>) -> Result<(), String> {
+    let start = path.unwrap_or(Path::new("."));
+    match store::find_index_upward(start) {
+        Some((idx, root)) => {
+            std::fs::remove_file(&idx).map_err(|e| e.to_string())?;
+            eprintln!("removed index for {}", root.display());
+            Ok(())
+        }
+        None => {
+            eprintln!("no index found for {}", start.display());
+            Ok(())
+        }
+    }
+}
+
+struct Printer {
+    color: bool,
+    heading: bool,
+    json: bool,
+    files_only: bool,
+    counts: bool,
+}
+
+impl Printer {
+    fn print(&self, results: &[FileResult]) -> std::io::Result<u64> {
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut total: u64 = 0;
+        let mut first = true;
+        for fr in results {
+            if self.files_only {
+                writeln!(out, "{}", fr.rel_path)?;
+                total += 1;
+                continue;
+            }
+            if self.counts {
+                writeln!(out, "{}:{}", fr.rel_path, fr.lines.len())?;
+                total += fr.lines.len() as u64;
+                continue;
+            }
+            if self.json {
+                for line in &fr.lines {
+                    total += 1;
+                    let text = String::from_utf8_lossy(&line.line);
+                    write!(
+                        out,
+                        "{{\"path\":{},\"line\":{},\"text\":{},\"spans\":[",
+                        json_str(&fr.rel_path),
+                        line.line_number,
+                        json_str(&text),
+                    )?;
+                    for (i, (s, e)) in line.spans.iter().enumerate() {
+                        if i > 0 {
+                            write!(out, ",")?;
+                        }
+                        write!(out, "[{s},{e}]")?;
+                    }
+                    writeln!(out, "]}}")?;
+                }
+                continue;
+            }
+            if self.heading {
+                if !first {
+                    writeln!(out)?;
+                }
+                if self.color {
+                    writeln!(out, "\x1b[35m{}\x1b[0m", fr.rel_path)?;
+                } else {
+                    writeln!(out, "{}", fr.rel_path)?;
+                }
+            }
+            first = false;
+            for line in &fr.lines {
+                total += 1;
+                let mut text: &[u8] = &line.line;
+                if text.last() == Some(&b'\r') {
+                    text = &text[..text.len() - 1];
+                }
+                if self.heading {
+                    if self.color {
+                        write!(out, "\x1b[32m{}\x1b[0m:", line.line_number)?;
+                    } else {
+                        write!(out, "{}:", line.line_number)?;
+                    }
+                } else if self.color {
+                    write!(
+                        out,
+                        "\x1b[35m{}\x1b[0m:\x1b[32m{}\x1b[0m:",
+                        fr.rel_path, line.line_number
+                    )?;
+                } else {
+                    write!(out, "{}:{}:", fr.rel_path, line.line_number)?;
+                }
+                write_highlighted(&mut out, text, &line.spans, self.color)?;
+                writeln!(out)?;
+            }
+        }
+        out.flush()?;
+        Ok(total)
+    }
+}
+
+fn write_highlighted(
+    out: &mut impl Write,
+    text: &[u8],
+    spans: &[(usize, usize)],
+    color: bool,
+) -> std::io::Result<()> {
+    if !color || spans.is_empty() {
+        out.write_all(text)?;
+        return Ok(());
+    }
+    let mut pos = 0;
+    for &(s, e) in spans {
+        let (s, e) = (s.min(text.len()), e.min(text.len()));
+        if s < pos {
+            continue;
+        }
+        out.write_all(&text[pos..s])?;
+        out.write_all(b"\x1b[1;31m")?;
+        out.write_all(&text[s..e])?;
+        out.write_all(b"\x1b[0m")?;
+        pos = e;
+    }
+    out.write_all(&text[pos..])?;
+    Ok(())
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
+    let pattern = cli.pattern.as_deref().expect("pattern checked in parse");
+    let search_path = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
+
+    let opts = SearchOptions {
+        case_insensitive: cli.case_insensitive,
+        fixed_string: cli.fixed,
+        matches_only: cli.files_only,
+        max_count: cli.max_count,
+        ..Default::default()
+    };
+    let matcher: Matcher = search::compile(pattern, &opts).map_err(|e| e.to_string())?;
+
+    if cli.explain {
+        println!("{}", matcher.query.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let t0 = Instant::now();
+    let (results, stats) = if cli.no_index {
+        let root = store::canonical_root(&search_path)
+            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
+    } else {
+        // Find (or build) an index that covers the search path.
+        let found = store::find_index_upward(&search_path);
+        let (idx, root) = match found {
+            Some(pair) => pair,
+            None => {
+                if cli.no_auto_index {
+                    return Err(format!(
+                        "no index covers {} (run: grix index, or pass --no-index)",
+                        search_path.display()
+                    ));
+                }
+                let root = store::canonical_root(&search_path)
+                    .map_err(|e| format!("cannot resolve path: {e}"))?;
+                eprintln!(
+                    "grix: no index for {} - building one (first run only)...",
+                    root.display()
+                );
+                let idx = store::index_path(&root).map_err(|e| e.to_string())?;
+                if let Some(parent) = idx.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let t = Instant::now();
+                let bstats = build::build(&root, &idx, None, &BuildOptions::default())
+                    .map_err(|e| format!("index build failed: {e}"))?;
+                eprintln!(
+                    "grix: indexed {} files in {:.2}s",
+                    human_count(bstats.files_total),
+                    t.elapsed().as_secs_f64()
+                );
+                (idx, root)
+            }
+        };
+        let reader = match IndexReader::open(&idx) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!(
+                    "cannot open index ({e}); run grix index to rebuild, or use --no-index"
+                ));
+            }
+        };
+        // Search path below the indexed root becomes a path prefix filter.
+        let canon = store::canonical_root(&search_path)
+            .map_err(|e| format!("cannot resolve path: {e}"))?;
+        let mut opts = opts.clone();
+        if canon != root {
+            if let Ok(rel) = canon.strip_prefix(&root) {
+                let mut prefix = rel.to_string_lossy().replace('\\', "/");
+                prefix.push('/');
+                opts.path_prefix = Some(prefix);
+            }
+        }
+        search::search_index(&reader, &root, &matcher, &opts).map_err(|e| e.to_string())?
+    };
+    let total_elapsed = t0.elapsed();
+
+    let color = match cli.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    };
+    let printer = Printer {
+        color,
+        heading: !cli.no_heading && std::io::stdout().is_terminal() && !cli.json,
+        json: cli.json,
+        files_only: cli.files_only,
+        counts: cli.counts,
+    };
+    printer.print(&results).map_err(|e| e.to_string())?;
+
+    if cli.stats {
+        eprintln!();
+        eprintln!("query plan:  {}", stats.query_display);
+        if stats.files_in_index > 0 {
+            eprintln!(
+                "index:       {} files; candidates after planning: {} ({:.3}%)",
+                human_count(stats.files_in_index),
+                human_count(stats.candidates),
+                100.0 * stats.candidates as f64 / stats.files_in_index.max(1) as f64
+            );
+        } else {
+            eprintln!("candidates:  {} (full scan)", human_count(stats.candidates));
+        }
+        eprintln!(
+            "scanned:     {} files; matched {} lines in {} files",
+            human_count(stats.files_scanned),
+            human_count(stats.lines_matched),
+            human_count(stats.files_matched),
+        );
+        eprintln!(
+            "timing:      postings {}µs · scan {}µs · total {:.1}ms",
+            stats.lookup_micros,
+            stats.scan_micros,
+            total_elapsed.as_secs_f64() * 1e3,
+        );
+    }
+
+    if results.is_empty() {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = match parse_args() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("grix: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let result = match cli.command {
+        Cmd::Index => cmd_index(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
+        Cmd::Status => cmd_status(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
+        Cmd::Forget => cmd_forget(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
+        Cmd::Search => cmd_search(&cli),
+    };
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("grix: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
