@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          name=grix-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/grix "$name/"
+          cp README.md README.en.md LICENSE "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "grix-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/grix.exe $name/
+          Copy-Item README.md,README.en.md,LICENSE $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "ARCHIVE=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # The create can race across matrix jobs; the loser just uploads.
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" --clobber --repo "$GITHUB_REPOSITORY"

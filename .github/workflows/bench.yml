@@ -31,7 +31,9 @@ jobs:
         run: |
           cd /tmp/corpus/linux-6.12
           echo "files: $(rg --files | wc -l)"
-          rg -l PageTransHuge | head -3; echo "rg exit: $?"
+          # NB: the explicit path matters — with stdin not a tty (CI), a
+          # pathless rg searches stdin instead of the working directory.
+          rg -l PageTransHuge . | head -3
       - name: Run benchmark
         run: |
           GRIX="$PWD/target/release/grix" RUNS=10 bash bench/run.sh /tmp/corpus/linux-6.12
