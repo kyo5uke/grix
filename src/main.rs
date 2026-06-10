@@ -346,7 +346,7 @@ fn write_highlighted(
             continue;
         }
         out.write_all(&text[pos..s])?;
-        out.write_all(b"\x1b[1;31m")?;
+        out.write_all(b"\x1b[30;43m")?; // highlighter-pen style: black on yellow
         out.write_all(&text[s..e])?;
         out.write_all(b"\x1b[0m")?;
         pos = e;
