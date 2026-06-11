@@ -9,6 +9,8 @@ a full scan takes seconds — with output that matches ripgrep line for line.
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+![ripgrep 1.57s vs grix 16.9ms on the linux kernel tree (92,823 files), identical matches](docs/bench-kernel.png)
+
 ```
 $ grix 'static\s+int\s+\w+_probe' .          # linux kernel source, 92k files
 drivers/gpu/drm/bridge/sii902x.c

@@ -9,6 +9,8 @@ ripgrep と行単位で一致します。
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+![Linuxカーネル92,823ファイルで ripgrep 1.57秒 vs grix 16.9ms（マッチ行は同一）](docs/bench-kernel.png)
+
 ## なぜ作ったか
 
 - **大きなツリーでは grep は遅い。** ripgrep は素晴らしいツールですが、毎回
