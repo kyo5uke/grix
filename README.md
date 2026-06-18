@@ -37,6 +37,7 @@ cargo install grix
 cd your-repo
 grix 'fn main'            # 初回は自動で索引を作成
 grix 'fn main'            # 2回目以降は索引を使って検索
+grix 'fn main' src/       # 検索範囲をディレクトリやファイルに絞る
 grix index                # pull 後などに増分更新
 ```
 

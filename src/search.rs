@@ -21,9 +21,26 @@ pub struct SearchOptions {
     /// Stop scanning a file at the first match (-l / -c file listings).
     pub matches_only: bool,
     pub threads: usize,
-    /// Restrict to files whose relative path starts with this prefix.
-    pub path_prefix: Option<String>,
+    /// Restrict to files under these scopes. Each scope is a `/`-separated
+    /// path relative to the index root; a file matches a scope when it equals
+    /// it (a file argument) or sits under it (a directory argument). Empty =
+    /// no restriction.
+    pub path_scopes: Vec<String>,
     pub max_count: Option<u64>,
+}
+
+/// True when `rel` is in scope: no scopes means everything, otherwise the
+/// path must equal one scope (file) or be nested under one (directory).
+pub fn in_scope(rel: &str, scopes: &[String]) -> bool {
+    if scopes.is_empty() {
+        return true;
+    }
+    scopes.iter().any(|s| {
+        rel == s
+            || (rel.len() > s.len()
+                && rel.as_bytes()[s.len()] == b'/'
+                && rel.starts_with(s.as_str()))
+    })
 }
 
 impl Default for SearchOptions {
@@ -35,7 +52,7 @@ impl Default for SearchOptions {
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
-            path_prefix: None,
+            path_scopes: Vec::new(),
             max_count: None,
         }
     }
@@ -306,10 +323,8 @@ pub fn search_index(
         if meta.flags & FLAG_BINARY != 0 {
             return Ok(());
         }
-        if let Some(prefix) = &opts.path_prefix {
-            if !meta.rel_path.starts_with(prefix.as_str()) {
-                return Ok(());
-            }
+        if !in_scope(meta.rel_path, &opts.path_scopes) {
+            return Ok(());
         }
         targets.push((id, meta.rel_path.to_string(), meta.size));
         Ok(())
@@ -404,10 +419,8 @@ pub fn search_walk(
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if let Some(prefix) = &opts.path_prefix {
-            if !rel_path.starts_with(prefix.as_str()) {
-                continue;
-            }
+        if !in_scope(&rel_path, &opts.path_scopes) {
+            continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         targets.push((0, rel_path, size));
@@ -509,6 +522,30 @@ mod tests {
         // Explicit \n in the pattern can match nothing, ever.
         assert!(scan_buffer(&re("static\\nint"), data, false, None).is_empty());
         assert!(scan_buffer(&re("static\\nint"), data, true, None).is_empty());
+    }
+
+    #[test]
+    fn scope_matching() {
+        let none: Vec<String> = vec![];
+        assert!(in_scope("anything/x.rs", &none)); // no scopes => all
+
+        let dir = vec!["src".to_string()];
+        assert!(in_scope("src/main.rs", &dir));
+        assert!(in_scope("src/a/b.rs", &dir));
+        assert!(in_scope("src", &dir)); // exact path (a file named src) still matches
+        assert!(!in_scope("src2/x.rs", &dir)); // prefix must end at a '/'
+        assert!(!in_scope("srcfile.rs", &dir));
+        assert!(!in_scope("tests/x.rs", &dir));
+
+        let file = vec!["deobf/clean/app-core.clean.jsx".to_string()];
+        assert!(in_scope("deobf/clean/app-core.clean.jsx", &file));
+        assert!(!in_scope("deobf/clean/app-core.clean.jsx.map", &file));
+        assert!(!in_scope("deobf/clean", &file));
+
+        let multi = vec!["src".to_string(), "docs/guide.md".to_string()];
+        assert!(in_scope("src/x.rs", &multi));
+        assert!(in_scope("docs/guide.md", &multi));
+        assert!(!in_scope("docs/other.md", &multi));
     }
 
     #[test]

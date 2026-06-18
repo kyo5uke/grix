@@ -211,17 +211,48 @@ fn incremental_update_reflects_edits() {
 }
 
 #[test]
-fn path_prefix_filters() {
+fn path_scope_dir_filters() {
     let fx = fixture();
     let reader = build_fixture_index(&fx);
     let opts = SearchOptions {
-        path_prefix: Some("src/".into()),
+        path_scopes: vec!["src".into()],
         ..Default::default()
     };
     let matcher = search::compile("foo", &opts).unwrap();
     let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
     assert!(!results.is_empty());
     assert!(results.iter().all(|r| r.rel_path.starts_with("src/")));
+}
+
+#[test]
+fn path_scope_single_file() {
+    let fx = fixture();
+    let reader = build_fixture_index(&fx);
+    let opts = SearchOptions {
+        path_scopes: vec!["src/lib.rs".into()],
+        ..Default::default()
+    };
+    let matcher = search::compile("foo", &opts).unwrap();
+    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].rel_path, "src/lib.rs");
+}
+
+#[test]
+fn path_scope_multiple() {
+    let fx = fixture();
+    let reader = build_fixture_index(&fx);
+    let opts = SearchOptions {
+        path_scopes: vec!["src".into(), "docs/guide.md".into()],
+        ..Default::default()
+    };
+    let matcher = search::compile("foo", &opts).unwrap();
+    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    assert!(results.iter().any(|r| r.rel_path.starts_with("src/")));
+    assert!(results.iter().any(|r| r.rel_path == "docs/guide.md"));
+    assert!(results
+        .iter()
+        .all(|r| r.rel_path.starts_with("src/") || r.rel_path == "docs/guide.md"));
 }
 
 #[test]

@@ -13,7 +13,9 @@ const USAGE: &str = "\
 grix - grep with an index
 
 USAGE:
-    grix [OPTIONS] <PATTERN> [PATH]    search (auto-indexes on first run)
+    grix [OPTIONS] <PATTERN> [PATH...]  search (auto-indexes on first run);
+                                        PATH... limits the search to those
+                                        files/directories
     grix index [PATH]                  build or refresh the index
     grix status [PATH]                 show index info
     grix forget [PATH]                 delete the index
@@ -38,6 +40,8 @@ OPTIONS:
 struct Cli {
     pattern: Option<String>,
     path: Option<PathBuf>,
+    /// Extra path arguments for `search`: files/dirs to scope the search to.
+    paths: Vec<PathBuf>,
     command: Cmd,
     case_insensitive: bool,
     fixed: bool,
@@ -72,6 +76,7 @@ fn parse_args() -> Result<Cli, String> {
     let mut cli = Cli {
         pattern: None,
         path: None,
+        paths: Vec::new(),
         command: Cmd::Search,
         case_insensitive: false,
         fixed: false,
@@ -146,7 +151,7 @@ fn parse_args() -> Result<Cli, String> {
         }
         Some(_) => {
             cli.pattern = Some(positionals.remove(0));
-            cli.path = positionals.first().map(PathBuf::from);
+            cli.paths = positionals.iter().map(PathBuf::from).collect();
         }
         None => return Err("missing pattern (try --help)".into()),
     }
@@ -373,9 +378,36 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// Turn `grix <pat> <path>...` arguments into scopes relative to the index
+/// root. A path equal to the root yields no scope (whole tree).
+fn paths_to_scopes(paths: &[PathBuf], root: &Path) -> Result<Vec<String>, String> {
+    let mut scopes = Vec::new();
+    for p in paths {
+        let canon =
+            store::canonical_root(p).map_err(|e| format!("cannot resolve {}: {e}", p.display()))?;
+        if canon == root {
+            continue; // searching the whole tree
+        }
+        let rel = canon.strip_prefix(root).map_err(|_| {
+            format!(
+                "{} is outside the indexed tree ({})",
+                p.display(),
+                root.display()
+            )
+        })?;
+        let scope = rel.to_string_lossy().replace('\\', "/");
+        if !scope.is_empty() {
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
+}
+
 fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     let pattern = cli.pattern.as_deref().expect("pattern checked in parse");
-    let search_path = cli.path.clone().unwrap_or_else(|| PathBuf::from("."));
+    // The index is anchored at the current directory; path arguments scope
+    // the search *within* it rather than choosing a different index.
+    let anchor = PathBuf::from(".");
 
     let opts = SearchOptions {
         case_insensitive: cli.case_insensitive,
@@ -394,21 +426,23 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     let t0 = Instant::now();
     let (results, stats) = if cli.no_index {
         let root =
-            store::canonical_root(&search_path).map_err(|e| format!("cannot resolve path: {e}"))?;
+            store::canonical_root(&anchor).map_err(|e| format!("cannot resolve path: {e}"))?;
+        let mut opts = opts.clone();
+        opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
         search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
     } else {
-        // Find (or build) an index that covers the search path.
-        let found = store::find_index_upward(&search_path);
+        // Find (or build) an index that covers the current directory.
+        let found = store::find_index_upward(&anchor);
         let (idx, root) = match found {
             Some(pair) => pair,
             None => {
                 if cli.no_auto_index {
-                    return Err(format!(
-                        "no index covers {} (run: grix index, or pass --no-index)",
-                        search_path.display()
-                    ));
+                    return Err(
+                        "no index covers the current directory (run: grix index, or pass --no-index)"
+                            .to_string(),
+                    );
                 }
-                let root = store::canonical_root(&search_path)
+                let root = store::canonical_root(&anchor)
                     .map_err(|e| format!("cannot resolve path: {e}"))?;
                 eprintln!(
                     "grix: no index for {} - building one (first run only)...",
@@ -437,17 +471,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
                 ));
             }
         };
-        // Search path below the indexed root becomes a path prefix filter.
-        let canon =
-            store::canonical_root(&search_path).map_err(|e| format!("cannot resolve path: {e}"))?;
         let mut opts = opts.clone();
-        if canon != root {
-            if let Ok(rel) = canon.strip_prefix(&root) {
-                let mut prefix = rel.to_string_lossy().replace('\\', "/");
-                prefix.push('/');
-                opts.path_prefix = Some(prefix);
-            }
-        }
+        opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
         search::search_index(&reader, &root, &matcher, &opts).map_err(|e| e.to_string())?
     };
     let total_elapsed = t0.elapsed();

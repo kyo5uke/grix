@@ -44,6 +44,7 @@ cargo install grix
 cd your-repo
 grix 'fn main'            # the first run builds the index
 grix 'fn main'            # later runs use the index
+grix 'fn main' src/       # limit the search to a directory or file
 grix index                # incremental update, e.g. after a pull
 ```
 
