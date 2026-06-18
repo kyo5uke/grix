@@ -26,6 +26,9 @@ OPTIONS:
     -l              list matching files only
     -c              print per-file match counts
     -m <N>          stop after N matching lines per file
+    -A <N>          show N lines of context after each match
+    -B <N>          show N lines of context before each match
+    -C <N>          show N lines of context before and after
     --json          machine-readable output (one JSON object per line)
     --stats         print planner/index statistics after searching
     --explain       print the trigram query plan and exit
@@ -48,6 +51,8 @@ struct Cli {
     files_only: bool,
     counts: bool,
     max_count: Option<u64>,
+    before: usize,
+    after: usize,
     json: bool,
     stats: bool,
     explain: bool,
@@ -83,6 +88,8 @@ fn parse_args() -> Result<Cli, String> {
         files_only: false,
         counts: false,
         max_count: None,
+        before: 0,
+        after: 0,
         json: false,
         stats: false,
         explain: false,
@@ -110,6 +117,32 @@ fn parse_args() -> Result<Cli, String> {
             "-m" => {
                 let v = args.next().ok_or("-m needs a number")?;
                 cli.max_count = Some(v.parse().map_err(|_| format!("bad -m value: {v}"))?);
+            }
+            "-A" | "-B" | "-C" => {
+                let v = args.next().ok_or(format!("{arg} needs a number"))?;
+                let n: usize = v.parse().map_err(|_| format!("bad {arg} value: {v}"))?;
+                match arg.as_str() {
+                    "-A" => cli.after = n,
+                    "-B" => cli.before = n,
+                    _ => {
+                        cli.before = n;
+                        cli.after = n;
+                    }
+                }
+            }
+            // grep-style attached form: -A3 / -B2 / -C1
+            s if s.starts_with("-A") || s.starts_with("-B") || s.starts_with("-C") => {
+                let n: usize = s[2..]
+                    .parse()
+                    .map_err(|_| format!("bad {} value: {}", &s[..2], &s[2..]))?;
+                match &s[..2] {
+                    "-A" => cli.after = n,
+                    "-B" => cli.before = n,
+                    _ => {
+                        cli.before = n;
+                        cli.after = n;
+                    }
+                }
             }
             "--json" => cli.json = true,
             "--stats" => cli.stats = true,
@@ -253,6 +286,8 @@ struct Printer {
     json: bool,
     files_only: bool,
     counts: bool,
+    /// Context (-A/-B/-C) is active; groups get "--" dividers like grep.
+    context: bool,
 }
 
 impl Printer {
@@ -268,12 +303,13 @@ impl Printer {
                 continue;
             }
             if self.counts {
-                writeln!(out, "{}:{}", fr.rel_path, fr.lines.len())?;
-                total += fr.lines.len() as u64;
+                let n = fr.lines.iter().filter(|l| l.is_match).count();
+                writeln!(out, "{}:{}", fr.rel_path, n)?;
+                total += n as u64;
                 continue;
             }
             if self.json {
-                for line in &fr.lines {
+                for line in fr.lines.iter().filter(|l| l.is_match) {
                     total += 1;
                     let text = String::from_utf8_lossy(&line.line);
                     write!(
@@ -303,27 +339,48 @@ impl Printer {
                     writeln!(out, "{}", fr.rel_path)?;
                 }
             }
+            // In no-heading mode grep divides every context group with "--",
+            // including across files. In heading mode files are already
+            // separated by a blank line + heading, so only intra-file gaps
+            // get a divider.
+            if self.context && !self.heading && !first {
+                writeln!(out, "--")?;
+            }
             first = false;
+            let mut prev_line: Option<u64> = None;
             for line in &fr.lines {
-                total += 1;
+                // A gap between emitted line numbers means a separate context
+                // group: print grep's "--" divider.
+                if let Some(p) = prev_line {
+                    if line.line_number > p + 1 {
+                        writeln!(out, "--")?;
+                    }
+                }
+                prev_line = Some(line.line_number);
+                if line.is_match {
+                    total += 1;
+                }
+                // grep convention: ':' after the locator for a match, '-' for
+                // a context line.
+                let sep = if line.is_match { ':' } else { '-' };
                 let mut text: &[u8] = &line.line;
                 if text.last() == Some(&b'\r') {
                     text = &text[..text.len() - 1];
                 }
                 if self.heading {
                     if self.color {
-                        write!(out, "\x1b[32m{}\x1b[0m:", line.line_number)?;
+                        write!(out, "\x1b[32m{}\x1b[0m{sep}", line.line_number)?;
                     } else {
-                        write!(out, "{}:", line.line_number)?;
+                        write!(out, "{}{sep}", line.line_number)?;
                     }
                 } else if self.color {
                     write!(
                         out,
-                        "\x1b[35m{}\x1b[0m:\x1b[32m{}\x1b[0m:",
+                        "\x1b[35m{}\x1b[0m{sep}\x1b[32m{}\x1b[0m{sep}",
                         fr.rel_path, line.line_number
                     )?;
                 } else {
-                    write!(out, "{}:{}:", fr.rel_path, line.line_number)?;
+                    write!(out, "{}{sep}{}{sep}", fr.rel_path, line.line_number)?;
                 }
                 write_highlighted(&mut out, text, &line.spans, self.color)?;
                 writeln!(out)?;
@@ -409,11 +466,16 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     // the search *within* it rather than choosing a different index.
     let anchor = PathBuf::from(".");
 
+    // Context is a feature of normal line output; -l (files) and -c (counts)
+    // ignore it, matching grep/ripgrep.
+    let want_context = !cli.files_only && !cli.counts && !cli.json;
     let opts = SearchOptions {
         case_insensitive: cli.case_insensitive,
         fixed_string: cli.fixed,
         matches_only: cli.files_only,
         max_count: cli.max_count,
+        before: if want_context { cli.before } else { 0 },
+        after: if want_context { cli.after } else { 0 },
         ..Default::default()
     };
     let matcher: Matcher = search::compile(pattern, &opts).map_err(|e| e.to_string())?;
@@ -488,6 +550,7 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         json: cli.json,
         files_only: cli.files_only,
         counts: cli.counts,
+        context: opts.before > 0 || opts.after > 0,
     };
     printer.print(&results).map_err(|e| e.to_string())?;
 

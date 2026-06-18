@@ -27,6 +27,9 @@ pub struct SearchOptions {
     /// no restriction.
     pub path_scopes: Vec<String>,
     pub max_count: Option<u64>,
+    /// Context lines to show before / after each matching line (-B / -A).
+    pub before: usize,
+    pub after: usize,
 }
 
 /// True when `rel` is in scope: no scopes means everything, otherwise the
@@ -54,6 +57,8 @@ impl Default for SearchOptions {
                 .unwrap_or(4),
             path_scopes: Vec::new(),
             max_count: None,
+            before: 0,
+            after: 0,
         }
     }
 }
@@ -61,9 +66,12 @@ impl Default for SearchOptions {
 #[derive(Debug)]
 pub struct MatchLine {
     pub line_number: u64,
-    /// Byte ranges of matches within `line`.
+    /// Byte ranges of matches within `line` (empty for context lines).
     pub spans: Vec<(usize, usize)>,
     pub line: Vec<u8>,
+    /// True for a line the pattern actually matched, false for a context line
+    /// pulled in by -A/-B/-C.
+    pub is_match: bool,
 }
 
 #[derive(Debug)]
@@ -237,6 +245,18 @@ pub fn scan_buffer(
     matches_only: bool,
     max_count: Option<u64>,
 ) -> Vec<MatchLine> {
+    scan_buffer_ctx(re, data, matches_only, max_count, 0, 0)
+}
+
+/// Scan one buffer, collecting matched lines plus `before`/`after` context.
+pub fn scan_buffer_ctx(
+    re: &regex::bytes::Regex,
+    data: &[u8],
+    matches_only: bool,
+    max_count: Option<u64>,
+    before: usize,
+    after: usize,
+) -> Vec<MatchLine> {
     let mut lines: Vec<MatchLine> = Vec::new();
     let mut line_no: u64 = 1;
     let mut counted_to: usize = 0; // newlines counted up to this offset
@@ -256,6 +276,7 @@ pub fn scan_buffer(
                 line_number: 0,
                 spans: Vec::new(),
                 line: Vec::new(),
+                is_match: true,
             });
             return lines;
         }
@@ -292,11 +313,71 @@ pub fn scan_buffer(
                 line_number: line_no,
                 spans: if e > s { vec![(s, e)] } else { Vec::new() },
                 line: data[line_start..line_end].to_vec(),
+                is_match: true,
             });
             cur_line = Some((line_start, line_end));
         }
     }
-    lines
+
+    if (before == 0 && after == 0) || lines.is_empty() {
+        return lines;
+    }
+    expand_context(data, lines, before, after)
+}
+
+/// Given the matching lines, pull in `before`/`after` neighbour lines.
+/// Returns lines in order, with context lines marked `is_match = false`.
+/// Overlapping context windows merge naturally (one entry per line number).
+fn expand_context(
+    data: &[u8],
+    matches: Vec<MatchLine>,
+    before: usize,
+    after: usize,
+) -> Vec<MatchLine> {
+    use std::collections::BTreeMap;
+
+    // line number -> spans, for the lines that actually matched.
+    let mut spans_by_line: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
+    // Wanted inclusive line ranges, merged.
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let lo = m.line_number.saturating_sub(before as u64).max(1);
+        let hi = m.line_number + after as u64;
+        match ranges.last_mut() {
+            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            _ => ranges.push((lo, hi)),
+        }
+    }
+    for m in matches {
+        spans_by_line.insert(m.line_number, m.spans);
+    }
+
+    let mut out: Vec<MatchLine> = Vec::new();
+    let mut start = 0usize;
+    let mut line_no: u64 = 1;
+    let mut ri = 0usize;
+    while start < data.len() {
+        let line_end = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
+        while ri < ranges.len() && ranges[ri].1 < line_no {
+            ri += 1;
+        }
+        if ri < ranges.len() && ranges[ri].0 <= line_no {
+            let spans = spans_by_line.remove(&line_no);
+            let is_match = spans.is_some();
+            out.push(MatchLine {
+                line_number: line_no,
+                spans: spans.unwrap_or_default(),
+                line: data[start..line_end].to_vec(),
+                is_match,
+            });
+        }
+        if line_end == data.len() {
+            break;
+        }
+        start = line_end + 1;
+        line_no += 1;
+    }
+    out
 }
 
 /// Search using an index. Returns per-file results sorted by path.
@@ -371,8 +452,14 @@ pub fn search_index(
                     if trigram::looks_binary(&data) {
                         continue;
                     }
-                    let lines =
-                        scan_buffer(&matcher.regex, &data, opts.matches_only, opts.max_count);
+                    let lines = scan_buffer_ctx(
+                        &matcher.regex,
+                        &data,
+                        opts.matches_only,
+                        opts.max_count,
+                        opts.before,
+                        opts.after,
+                    );
                     if !lines.is_empty() {
                         local.push(FileResult {
                             rel_path: rel.clone(),
@@ -390,7 +477,10 @@ pub fn search_index(
     let mut results = results.into_inner().unwrap();
     results.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
     stats.files_matched = results.len();
-    stats.lines_matched = results.iter().map(|r| r.lines.len()).sum();
+    stats.lines_matched = results
+        .iter()
+        .map(|r| r.lines.iter().filter(|l| l.is_match).count())
+        .sum();
     Ok((results, stats))
 }
 
@@ -449,8 +539,14 @@ pub fn search_walk(
                     if trigram::looks_binary(&data) {
                         continue;
                     }
-                    let lines =
-                        scan_buffer(&matcher.regex, &data, opts.matches_only, opts.max_count);
+                    let lines = scan_buffer_ctx(
+                        &matcher.regex,
+                        &data,
+                        opts.matches_only,
+                        opts.max_count,
+                        opts.before,
+                        opts.after,
+                    );
                     if !lines.is_empty() {
                         local.push(FileResult {
                             rel_path: rel.clone(),
@@ -468,7 +564,10 @@ pub fn search_walk(
     let mut results = results.into_inner().unwrap();
     results.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
     stats.files_matched = results.len();
-    stats.lines_matched = results.iter().map(|r| r.lines.len()).sum();
+    stats.lines_matched = results
+        .iter()
+        .map(|r| r.lines.iter().filter(|l| l.is_match).count())
+        .sum();
     Ok((results, stats))
 }
 
@@ -510,6 +609,38 @@ mod tests {
         let lines = scan_buffer(&re("^abc$"), data, false, None);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].line_number, 2);
+    }
+
+    #[test]
+    fn context_before_after() {
+        let data = b"l1\nl2\nMATCH\nl4\nl5\n";
+        // -C1: line 2, MATCH(3), line 4.
+        let lines = scan_buffer_ctx(&re("MATCH"), data, false, None, 1, 1);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![2, 3, 4]);
+        assert!(!lines[0].is_match);
+        assert!(lines[1].is_match);
+        assert_eq!(lines[1].line, b"MATCH");
+        assert!(!lines[2].is_match);
+        // -B2 clamps at the top of the file.
+        let lines = scan_buffer_ctx(&re("MATCH"), data, false, None, 2, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.line_number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn context_windows_merge() {
+        // Two matches whose context windows touch should not duplicate lines.
+        let data = b"a\nHIT\nb\nHIT\nc\n";
+        let lines = scan_buffer_ctx(&re("HIT"), data, false, None, 1, 1);
+        // lines 1..5 all covered exactly once, in order.
+        assert_eq!(
+            lines.iter().map(|l| l.line_number).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(lines.iter().filter(|l| l.is_match).count(), 2);
     }
 
     #[test]

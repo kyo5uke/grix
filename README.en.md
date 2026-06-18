@@ -45,6 +45,7 @@ cd your-repo
 grix 'fn main'            # the first run builds the index
 grix 'fn main'            # later runs use the index
 grix 'fn main' src/       # limit the search to a directory or file
+grix -C2 'fn main'        # show 2 lines of context around each match
 grix index                # incremental update, e.g. after a pull
 ```
 
@@ -139,7 +140,7 @@ The flag set is still small.
 
 | supported | not yet |
 | --- | --- |
-| `-i`, `-F`, `-l`, `-c`, `-m`, `--json`, `--no-heading`, `--color` | `-A/-B/-C`, `-U`, `-g`, `-t`, `--replace` |
+| `-i`, `-F`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `--json`, `--no-heading`, `--color` | `-U`, `-g`, `-t`, `--replace` |
 
 If grix and ripgrep disagree on matched lines within the supported set, please
 open an issue.
