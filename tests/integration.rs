@@ -296,4 +296,19 @@ fn binary_smoke_exit_codes() {
     let out = run(&["status"]);
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).contains("files:"));
+
+    // Without context, plain output has no "--" dividers between matches,
+    // even when matches are on non-adjacent lines (regression guard).
+    let out = run(&["foo", "--color", "never", "--no-heading"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("--\n"), "unexpected divider:\n{stdout}");
+
+    // -g scopes to a glob (only .md files here contain "foo" in docs/).
+    let out = run(&["foo", "-g", "*.md", "--color", "never", "--no-heading"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.lines().all(|l| l.starts_with("docs/")), "{stdout}");
+
+    // -C adds context and the "--" divider returns.
+    let out = run(&["needle", "-C1", "--color", "never", "--no-heading"]);
+    assert_eq!(out.status.code(), Some(0));
 }

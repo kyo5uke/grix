@@ -30,6 +30,70 @@ pub struct SearchOptions {
     /// Context lines to show before / after each matching line (-B / -A).
     pub before: usize,
     pub after: usize,
+    /// Glob filters (-g). A leading `!` excludes; otherwise, the presence of
+    /// any positive glob restricts results to files that match one.
+    pub globs: Vec<String>,
+    /// File types to include (-t) and exclude (-T), by name (e.g. "rust").
+    pub types_select: Vec<String>,
+    pub types_negate: Vec<String>,
+}
+
+/// Filename-based filtering (-g / -t / -T), built from `SearchOptions` once
+/// per search. Reuses the same glob and type machinery as ripgrep.
+pub struct FileFilter {
+    overrides: Option<ignore::overrides::Override>,
+    types: Option<ignore::types::Types>,
+}
+
+impl FileFilter {
+    pub fn build(opts: &SearchOptions) -> Result<Self, SearchError> {
+        let overrides = if opts.globs.is_empty() {
+            None
+        } else {
+            let mut b = ignore::overrides::OverrideBuilder::new(".");
+            for g in &opts.globs {
+                b.add(g)
+                    .map_err(|e| SearchError::BadPattern(format!("bad glob {g:?}: {e}")))?;
+            }
+            Some(
+                b.build()
+                    .map_err(|e| SearchError::BadPattern(format!("bad glob: {e}")))?,
+            )
+        };
+        let types = if opts.types_select.is_empty() && opts.types_negate.is_empty() {
+            None
+        } else {
+            let mut b = ignore::types::TypesBuilder::new();
+            b.add_defaults();
+            for t in &opts.types_select {
+                b.select(t);
+            }
+            for t in &opts.types_negate {
+                b.negate(t);
+            }
+            Some(
+                b.build()
+                    .map_err(|e| SearchError::BadPattern(format!("unknown file type: {e}")))?,
+            )
+        };
+        Ok(FileFilter { overrides, types })
+    }
+
+    /// True when a file at `rel` (a `/`-separated relative path) passes the
+    /// glob and type filters.
+    pub fn accept(&self, rel: &str) -> bool {
+        if let Some(ov) = &self.overrides {
+            if ov.matched(rel, false).is_ignore() {
+                return false;
+            }
+        }
+        if let Some(ty) = &self.types {
+            if ty.matched(rel, false).is_ignore() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// True when `rel` is in scope: no scopes means everything, otherwise the
@@ -59,6 +123,9 @@ impl Default for SearchOptions {
             max_count: None,
             before: 0,
             after: 0,
+            globs: Vec::new(),
+            types_select: Vec::new(),
+            types_negate: Vec::new(),
         }
     }
 }
@@ -393,18 +460,20 @@ pub fn search_index(
         ..Default::default()
     };
 
+    let filter = FileFilter::build(opts)?;
+
     let t0 = Instant::now();
     let ids = eval(&matcher.query, reader)?;
     stats.lookup_micros = t0.elapsed().as_micros();
 
-    // Candidates = query hits + always-scan files − binary, path-filtered.
+    // Candidates = query hits + always-scan files − binary, path/glob/type-filtered.
     let mut targets: Vec<(u32, String, u64)> = Vec::with_capacity(ids.len());
     let mut push_target = |id: u32| -> Result<(), SearchError> {
         let meta = reader.file(id).map_err(SearchError::Index)?;
         if meta.flags & FLAG_BINARY != 0 {
             return Ok(());
         }
-        if !in_scope(meta.rel_path, &opts.path_scopes) {
+        if !in_scope(meta.rel_path, &opts.path_scopes) || !filter.accept(meta.rel_path) {
             return Ok(());
         }
         targets.push((id, meta.rel_path.to_string(), meta.size));
@@ -495,6 +564,7 @@ pub fn search_walk(
         ..Default::default()
     };
 
+    let filter = FileFilter::build(opts)?;
     let mut targets: Vec<(u32, String, u64)> = Vec::new();
     let walker = ignore::WalkBuilder::new(root).build();
     for entry in walker.flatten() {
@@ -509,7 +579,7 @@ pub fn search_walk(
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if !in_scope(&rel_path, &opts.path_scopes) {
+        if !in_scope(&rel_path, &opts.path_scopes) || !filter.accept(&rel_path) {
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -677,6 +747,54 @@ mod tests {
         assert!(in_scope("src/x.rs", &multi));
         assert!(in_scope("docs/guide.md", &multi));
         assert!(!in_scope("docs/other.md", &multi));
+    }
+
+    fn filter(globs: &[&str], select: &[&str], negate: &[&str]) -> FileFilter {
+        let opts = SearchOptions {
+            globs: globs.iter().map(|s| s.to_string()).collect(),
+            types_select: select.iter().map(|s| s.to_string()).collect(),
+            types_negate: negate.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        FileFilter::build(&opts).unwrap()
+    }
+
+    #[test]
+    fn glob_filter() {
+        let f = filter(&["*.rs"], &[], &[]);
+        assert!(f.accept("src/main.rs"));
+        assert!(!f.accept("README.md"));
+        assert!(!f.accept("src/data.json"));
+
+        // exclusion glob
+        let f = filter(&["!*.rs"], &[], &[]);
+        assert!(!f.accept("src/main.rs"));
+        assert!(f.accept("README.md"));
+
+        // no globs => everything
+        let f = filter(&[], &[], &[]);
+        assert!(f.accept("anything.xyz"));
+    }
+
+    #[test]
+    fn type_filter() {
+        let f = filter(&[], &["rust"], &[]);
+        assert!(f.accept("src/main.rs"));
+        assert!(!f.accept("script.py"));
+
+        // negate a type
+        let f = filter(&[], &[], &["rust"]);
+        assert!(!f.accept("src/main.rs"));
+        assert!(f.accept("script.py"));
+    }
+
+    #[test]
+    fn unknown_type_errors() {
+        let opts = SearchOptions {
+            types_select: vec!["definitely-not-a-type".into()],
+            ..Default::default()
+        };
+        assert!(FileFilter::build(&opts).is_err());
     }
 
     #[test]

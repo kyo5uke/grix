@@ -29,6 +29,9 @@ OPTIONS:
     -A <N>          show N lines of context after each match
     -B <N>          show N lines of context before each match
     -C <N>          show N lines of context before and after
+    -g <GLOB>       only search files matching the glob (!GLOB to exclude)
+    -t <TYPE>       only search files of TYPE (e.g. rust, py, js)
+    -T <TYPE>       exclude files of TYPE
     --json          machine-readable output (one JSON object per line)
     --stats         print planner/index statistics after searching
     --explain       print the trigram query plan and exit
@@ -53,6 +56,9 @@ struct Cli {
     max_count: Option<u64>,
     before: usize,
     after: usize,
+    globs: Vec<String>,
+    types_select: Vec<String>,
+    types_negate: Vec<String>,
     json: bool,
     stats: bool,
     explain: bool,
@@ -90,6 +96,9 @@ fn parse_args() -> Result<Cli, String> {
         max_count: None,
         before: 0,
         after: 0,
+        globs: Vec::new(),
+        types_select: Vec::new(),
+        types_negate: Vec::new(),
         json: false,
         stats: false,
         explain: false,
@@ -143,6 +152,18 @@ fn parse_args() -> Result<Cli, String> {
                         cli.after = n;
                     }
                 }
+            }
+            "-g" => {
+                let v = args.next().ok_or("-g needs a glob")?;
+                cli.globs.push(v);
+            }
+            "-t" => {
+                let v = args.next().ok_or("-t needs a type name")?;
+                cli.types_select.push(v);
+            }
+            "-T" => {
+                let v = args.next().ok_or("-T needs a type name")?;
+                cli.types_negate.push(v);
             }
             "--json" => cli.json = true,
             "--stats" => cli.stats = true,
@@ -349,11 +370,14 @@ impl Printer {
             first = false;
             let mut prev_line: Option<u64> = None;
             for line in &fr.lines {
-                // A gap between emitted line numbers means a separate context
-                // group: print grep's "--" divider.
-                if let Some(p) = prev_line {
-                    if line.line_number > p + 1 {
-                        writeln!(out, "--")?;
+                // With context on, a gap between emitted line numbers means a
+                // separate group: print grep's "--" divider. Without context,
+                // grep prints no divider between non-adjacent matches.
+                if self.context {
+                    if let Some(p) = prev_line {
+                        if line.line_number > p + 1 {
+                            writeln!(out, "--")?;
+                        }
                     }
                 }
                 prev_line = Some(line.line_number);
@@ -476,6 +500,9 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         max_count: cli.max_count,
         before: if want_context { cli.before } else { 0 },
         after: if want_context { cli.after } else { 0 },
+        globs: cli.globs.clone(),
+        types_select: cli.types_select.clone(),
+        types_negate: cli.types_negate.clone(),
         ..Default::default()
     };
     let matcher: Matcher = search::compile(pattern, &opts).map_err(|e| e.to_string())?;
