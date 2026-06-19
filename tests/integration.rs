@@ -311,4 +311,37 @@ fn binary_smoke_exit_codes() {
     // -C adds context and the "--" divider returns.
     let out = run(&["needle", "-C1", "--color", "never", "--no-heading"]);
     assert_eq!(out.status.code(), Some(0));
+
+    // A file created AFTER the index exists is still found: each search
+    // refreshes the index by default (regression guard for the silent
+    // stale-index miss).
+    std::fs::write(
+        fx.root.join("added_after.rs"),
+        b"const SURPRISE_TOK: u8 = 0;\n",
+    )
+    .unwrap();
+    let out = run(&["SURPRISE_TOK", "--color", "never", "--no-heading"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "auto-refresh should find new file"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("added_after.rs"));
+
+    // With --no-auto-index the index is used as-is, so a brand-new file is
+    // missed -- but grix says why instead of a silent 0 result.
+    std::fs::write(
+        fx.root.join("added_later.rs"),
+        b"const LATER_TOK: u8 = 0;\n",
+    )
+    .unwrap();
+    let out = run(&[
+        "LATER_TOK",
+        "--no-auto-index",
+        "--color",
+        "never",
+        "--no-heading",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("stale"));
 }

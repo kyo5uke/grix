@@ -13,9 +13,9 @@ const USAGE: &str = "\
 grix - grep with an index
 
 USAGE:
-    grix [OPTIONS] <PATTERN> [PATH...]  search (auto-indexes on first run);
-                                        PATH... limits the search to those
-                                        files/directories
+    grix [OPTIONS] <PATTERN> [PATH...]  search (auto-indexes, and refreshes
+                                        the index, on each run); PATH... limits
+                                        the search to those files/directories
     grix index [PATH]                  build or refresh the index
     grix status [PATH]                 show index info
     grix forget [PATH]                 delete the index
@@ -36,7 +36,9 @@ OPTIONS:
     --stats         print planner/index statistics after searching
     --explain       print the trigram query plan and exit
     --no-index      scan without using or building an index
-    --no-auto-index fail instead of building a missing index
+    --no-auto-index use the existing index as-is: skip the pre-search
+                    refresh and never build a missing one (fastest, but
+                    results can be stale)
     --no-heading    grep-style path:line:text output
     --color <WHEN>  always | never | auto (default: auto)
     -h, --help      show this help
@@ -523,7 +525,30 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         // Find (or build) an index that covers the current directory.
         let found = store::find_index_upward(&anchor);
         let (idx, root) = match found {
-            Some(pair) => pair,
+            Some((idx, root)) => {
+                // Keep the index current: a quick incremental refresh before
+                // searching so files added/changed since the last build are
+                // picked up. Unchanged files are reused (no re-read), so this
+                // is a directory walk + stat, not a full rebuild. Skipped with
+                // --no-auto-index for the fastest, use-as-is path.
+                if !cli.no_auto_index {
+                    let old = IndexReader::open(&idx).ok();
+                    let t = Instant::now();
+                    match build::build(&root, &idx, old.as_ref(), &BuildOptions::default()) {
+                        Ok(bstats) if cli.stats => eprintln!(
+                            "refresh:     {} changed/new, {} reused in {:.2}s",
+                            human_count(bstats.files_indexed),
+                            human_count(bstats.files_reused),
+                            t.elapsed().as_secs_f64()
+                        ),
+                        Ok(_) => {}
+                        // A failed refresh is non-fatal: fall back to the
+                        // existing index rather than abort the search.
+                        Err(e) => eprintln!("grix: index refresh skipped ({e})"),
+                    }
+                }
+                (idx, root)
+            }
             None => {
                 if cli.no_auto_index {
                     return Err(
@@ -609,6 +634,14 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     }
 
     if results.is_empty() {
+        // With --no-auto-index we used the index as-is; a 0-result here might
+        // just mean the index is stale. Say so instead of looking like a
+        // definitive "not found".
+        if cli.no_auto_index && !cli.no_index && stats.files_in_index > 0 {
+            eprintln!(
+                "grix: no matches (index used as-is via --no-auto-index; it may be stale - run `grix index` or drop the flag to auto-refresh)"
+            );
+        }
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)

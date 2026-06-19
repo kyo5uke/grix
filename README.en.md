@@ -42,13 +42,17 @@ differ.
 cargo install grix
 
 cd your-repo
-grix 'fn main'            # the first run builds the index
-grix 'fn main'            # later runs use the index
+grix 'fn main'            # first run builds the index; every run refreshes it
 grix 'fn main' src/       # limit the search to a directory or file
 grix -C2 'fn main'        # show 2 lines of context around each match
 grix -t rust 'fn main'    # filter by file type (or -g '*.rs')
-grix index                # incremental update, e.g. after a pull
+grix --no-auto-index 'fn main'  # use the index as-is, no refresh (fastest, may be stale)
 ```
+
+Each search refreshes the index first, so results are always up to date.
+Unchanged files are not re-read (matched by size and mtime), so a refresh is
+mostly just a directory walk.
+For the fastest path that uses the existing index as-is, pass `--no-auto-index`.
 
 No daemon, no config file.
 Nothing to download, no model.
@@ -69,6 +73,9 @@ The machine is Windows 11, NVMe, ripgrep 15.1.0.
 Reproduce with [`bench/run.sh`](bench/run.sh).
 Every pattern is checked for identical match counts between ripgrep and grix
 before it is timed.
+grix is timed with `--no-auto-index` (using the index as-is, without the
+pre-search refresh). That is the query speed itself, and is also what a normal
+search costs when the tree hasn't changed.
 
 | pattern | matched lines | ripgrep | grix | speedup |
 | --- | ---: | ---: | ---: | ---: |
