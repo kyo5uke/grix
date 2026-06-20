@@ -1,174 +1,190 @@
 # grix
 
-[English](README.en.md) | 日本語
+English | [日本語](README.ja.md)
 
-grix は trigram 索引を使う grep です。
+grix is a grep that uses a trigram index.
 
-初回にディレクトリツリーの索引を作り、次回からはその索引で候補ファイルを絞って検索します。
-候補ファイルには実際に regex を走らせるので、対応している範囲では ripgrep と同じ行を返します。
+It indexes a directory tree once, then uses that index to narrow searches to a
+small set of candidate files.
+It runs the real regex on those candidates, so within the features it supports
+it returns the same lines as ripgrep.
 
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![Linuxカーネル92,823ファイルで ripgrep 1.57秒、grix 16.9ms。マッチ行は同一](docs/bench-kernel.png)
+![ripgrep 1.57s, grix 16.9ms on the linux kernel tree (92,823 files); identical matches](docs/bench-kernel.png)
 
-## なぜ作ったか
+## Why
 
-ripgrep は速いですが、検索するたびに対象ファイルを読み直します。
-小さいリポジトリなら気になりませんが、大きいツリーでは1回の検索に数秒かかることがあります。
-コールドキャッシュやネットワークドライブだと、さらに待つことになります。
+ripgrep is fast, but it reads the files again on every search.
+That is fine on a small repository, but on a large tree a single search can take
+seconds.
+With a cold cache or a network drive you wait even longer.
 
-実際の作業では、同じツリーを何度も検索することが多いです。
-リファクタリング、コードレビュー、AI コーディングエージェントなどでは、
-1つのセッションで grep が何十回、何百回も走ります。
-grix はそのたびに全ファイルを読む代わりに、索引から候補ファイルを引きます。
+In real work you tend to search the same tree many times.
+Refactoring, code review, and AI coding agents can run grep tens or hundreds of
+times in one session.
+Instead of reading every file each time, grix looks the candidates up in the
+index.
 
-近似検索ではありません。
-embedding やセマンティック検索ではなく、最後は実際のファイル内容に regex をかけて確認します。
-対応している検索で grix と ripgrep の出力行が違う場合は、grix 側のバグです。
-テストにも「索引あり検索とフルスキャンの結果が一致する」ことを確認する性質テストを入れています。
-ベンチマークスクリプトも、両方のマッチ行数が一致しない場合は計測を止めます。
+It is not approximate search.
+There is no embedding or semantic matching; the final step always runs the real
+regex against the actual file contents.
+If grix and ripgrep ever return different lines for a supported search, that is a
+bug in grix.
+There is a property test that checks indexed search and a full scan return the
+same results, and the benchmark script stops if the two tools' match counts
+differ.
 
-## インストール
+## Install
 
 ```bash
-cargo install grix              # ソースからビルド
-cargo binstall grix             # ビルド済みバイナリを取得
+cargo install grix              # build from source
+cargo binstall grix             # fetch a prebuilt binary
 brew install kyo5uke/tap/grix   # macOS / Linux
 ```
 
-ビルド済みバイナリは [Releases](https://github.com/kyo5uke/grix/releases) からも入手できます（Windows 含む）。
+Prebuilt binaries (including Windows) are also on the [Releases](https://github.com/kyo5uke/grix/releases) page.
 
-## 使い方
+## Usage
 
 ```bash
 cd your-repo
-grix 'fn main'            # 初回は索引を作成。以降は毎回、検索前に索引を増分更新
-grix 'fn main' src/       # 検索範囲をディレクトリやファイルに絞る
-grix -C2 'fn main'        # 前後2行を表示
-grix -t rust 'fn main'    # 型で絞る（-g '*.rs' でも可）
-grix --no-auto-index 'fn main'  # 更新せず既存索引のまま検索（最速・古い可能性あり）
+grix 'fn main'            # first run builds the index; every run refreshes it
+grix 'fn main' src/       # limit the search to a directory or file
+grix -C2 'fn main'        # show 2 lines of context around each match
+grix -t rust 'fn main'    # filter by file type (or -g '*.rs')
+grix --no-auto-index 'fn main'  # use the index as-is, no refresh (fastest, may be stale)
 ```
 
-各検索の前に増分更新が走るので、結果は常に最新です。
-未変更のファイルは読み直さない（サイズと mtime で判定）ので、更新はディレクトリ走査が主なコストです。
-更新を省いて既存の索引をそのまま使う最速の経路がほしいときは `--no-auto-index` を付けます。
+Each search refreshes the index first, so results are always up to date.
+Unchanged files are not re-read (matched by size and mtime), so a refresh is
+mostly just a directory walk.
+For the fastest path that uses the existing index as-is, pass `--no-auto-index`.
 
-デーモンや設定ファイルは不要です。
-モデルのダウンロードなどもありません。
+No daemon, no config file.
+Nothing to download, no model.
 
-索引はキャッシュディレクトリに保存します。
+The index is stored under your cache directory.
 
 * Windows: `%LOCALAPPDATA%\grix`
 * Linux/macOS: `~/.cache/grix`
 
-リポジトリ内には何も書き込みません。
+It never writes anything inside the repository.
 
-## ベンチマーク
+## Benchmarks
 
-Linux カーネルソース v6.12 で計測しました。
-対象は 92,823 ファイル、約 1.4GB です。
+Measured on the Linux kernel source v6.12.
+The tree is 92,823 files, about 1.4GB.
 
-環境は Windows 11、NVMe、ripgrep 15.1.0。
-[`bench/run.sh`](bench/run.sh) で再現できます。
-全パターンで、ripgrep と grix のマッチ行数が一致することを確認してから計測しています。
-grix は `--no-auto-index`（増分更新を挟まず索引をそのまま使う）での数値です。これはクエリ自体の速さで、ツリーが未変更なら通常検索でもほぼ同じです。
+The machine is Windows 11, NVMe, ripgrep 15.1.0.
+Reproduce with [`bench/run.sh`](bench/run.sh).
+Every pattern is checked for identical match counts between ripgrep and grix
+before it is timed.
+grix is timed with `--no-auto-index` (using the index as-is, without the
+pre-search refresh). That is the query speed itself, and is also what a normal
+search costs when the tree hasn't changed.
 
-| パターン                              |   一致行数 | ripgrep |   grix |    倍率 |
-| --------------------------------- | -----: | ------: | -----: | ----: |
-| `PageTransHuge`（まれなリテラル）          |      5 |  2.31 s |  97 ms | 23.7× |
-| `EXPORT_SYMBOL`（頻出リテラル）           | 38,267 |  2.29 s | 195 ms | 11.7× |
-| `static\s+int\s+\w+_probe`（regex） | 10,081 |  2.10 s | 288 ms |  7.3× |
-| `spinlock`（`-i`）                  | 17,086 |  2.23 s | 223 ms | 10.0× |
-| `zzqqxx_does_not_exist`（ヒットなし）    |      0 |  2.09 s |  41 ms | 50.5× |
+| pattern | matched lines | ripgrep | grix | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `PageTransHuge` (rare literal) | 5 | 2.31 s | 97 ms | 23.7× |
+| `EXPORT_SYMBOL` (common literal) | 38,267 | 2.29 s | 195 ms | 11.7× |
+| `static\s+int\s+\w+_probe` (regex) | 10,081 | 2.10 s | 288 ms | 7.3× |
+| `spinlock` (`-i`) | 17,086 | 2.23 s | 223 ms | 10.0× |
+| `zzqqxx_does_not_exist` (no match) | 0 | 2.09 s | 41 ms | 50.5× |
 
-索引サイズは 162 MiB です。
-初回構築は約 26 秒でした。
-ファイルシステムキャッシュが冷えている場合は、約 90 秒かかりました。
+The index is 162 MiB.
+The first build took about 26 seconds.
+With a cold filesystem cache it took about 90 seconds.
 
-無変更時の `grix index` は約 2.4 秒です。
-その場合、ファイル内容は読み直しません。
+An unchanged `grix index` takes about 2.4 seconds.
+In that case it does not re-read any file contents.
 
-Linux でも計測しています。
-GitHub Actions の通常ランナー 4 コアでの結果です。
-公開ログは[こちら](https://github.com/kyo5uke/grix/actions/runs/27286573555)です。
+There are Linux numbers too.
+These are from a stock GitHub Actions runner with 4 cores.
+The log is [public](https://github.com/kyo5uke/grix/actions/runs/27286573555).
 
-| パターン                              | ripgrep |   grix |    倍率 |
-| --------------------------------- | ------: | -----: | ----: |
-| `PageTransHuge`（まれなリテラル）          |  338 ms | 7.6 ms | 44.6× |
-| `EXPORT_SYMBOL`（頻出リテラル）           |  355 ms |  63 ms |  5.6× |
-| `static\s+int\s+\w+_probe`（regex） |  390 ms |  99 ms |  4.0× |
-| `spinlock`（`-i`）                  |  409 ms |  71 ms |  5.8× |
-| `zzqqxx_does_not_exist`（ヒットなし）    |  335 ms | 7.6 ms | 44.0× |
+| pattern | ripgrep | grix | speedup |
+| --- | ---: | ---: | ---: |
+| `PageTransHuge` (rare literal) | 338 ms | 7.6 ms | 44.6× |
+| `EXPORT_SYMBOL` (common literal) | 355 ms | 63 ms | 5.6× |
+| `static\s+int\s+\w+_probe` (regex) | 390 ms | 99 ms | 4.0× |
+| `spinlock` (`-i`) | 409 ms | 71 ms | 5.8× |
+| `zzqqxx_does_not_exist` (no match) | 335 ms | 7.6 ms | 44.0× |
 
-Windows はディレクトリ走査のコストが大きいので、環境によって差は変わります。
-それでも、大きいツリーを繰り返し検索する用途ではかなり効きます。
+Directory walks cost more on Windows, so the gap varies by environment.
+Either way it helps a lot when you search a large tree repeatedly.
 
-## 仕組み
+## How it works
 
-trigram は連続する3バイトです。
-たとえば `hello` を含むファイルは、必ず `hel`、`ell`、`llo` を含みます。
+A trigram is three consecutive bytes.
+A file that contains `hello` must contain `hel`, `ell`, and `llo`.
 
-つまり、trigram からファイル一覧を引ける索引があれば、
-1GB のファイルを毎回読む代わりに、いくつかのソート済みリストを交差させるだけで候補を絞れます。
+So if you have an index from trigrams to the files that contain them, you can
+narrow the candidates by intersecting a few sorted lists instead of reading a
+gigabyte of files every time.
 
-grix は regex パターンから trigram の制約を取り出します。
+grix extracts trigram constraints from the regex pattern.
 
-* `abc.*def` は `abc` AND `def`
-* `abc|xyz` は `abc` OR `xyz`
+* `abc.*def` becomes `abc` AND `def`
+* `abc|xyz` becomes `abc` OR `xyz`
 
-この考え方は、Russ Cox による Google Code Search の trigram プランナを元にしています。
+This is based on Russ Cox's trigram planner for Google Code Search.
 
-索引で絞ったファイルには、最後に本物の regex を現在の内容に対して実行します。
-そのため、索引が古くても存在しない行を表示することはありません。
-ただし、最近追加された行は、索引を更新するまで見落とす可能性があります。
+After narrowing with the index, grix runs the real regex against the current
+contents of those files.
+So an out-of-date index never shows a line that is not there.
+It can only miss lines added since the last index update.
 
-`grix --explain` を使うと、任意のパターンがどのような trigram プランになるか確認できます。
-詳しくは [ARCHITECTURE.md](ARCHITECTURE.md) に書いています。
+`grix --explain` shows the trigram plan for any pattern.
+There is more detail in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## ripgrep 互換性
+## ripgrep compatibility
 
-出力形式、終了コード、gitignore の扱い、バイナリ検出、行の意味論は ripgrep に合わせています。
+The output format, exit codes, gitignore handling, binary detection, and line
+semantics follow ripgrep.
 
-対応している主な形式は次のとおりです。
+The main supported forms are:
 
-* 通常出力: `path:line:text`
-* tty でのヘッダ形式
-* 終了コード: 0 / 1 / 2
+* default output: `path:line:text`
+* heading style on a tty
+* exit codes: 0 / 1 / 2
 * `--json`
 * `--color`
 
-フラグはまだ最小限です。
+The flag set is still small.
 
-| 対応済み                                                                                        | 未対応               |
-| ----------------------------------------------------------------------------------------- | ----------------- |
+| supported | not yet |
+| --- | --- |
 | `-i`, `-F`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `--json`, `--no-heading`, `--color` | `-U`, `--replace` |
 
-対応済みの範囲で grix と ripgrep のマッチ行が食い違ったら、issue をください。
+If grix and ripgrep disagree on matched lines within the supported set, please
+open an issue.
 
-## AI コーディングエージェントで使う
+## Using it with AI coding agents
 
-AI コーディングエージェントは、同じツリーに対して何度も grep を実行します。
-そのたびに全ファイルを読む代わりに grix を使わせると、検索の待ち時間をかなり減らせます。
+AI coding agents run grep against the same tree over and over.
+Pointing them at grix instead of reading every file each time cuts the search
+wait noticeably.
 
-`--json` では1行1オブジェクトの機械可読な出力を返します。
-`--stats` や `--explain` を使うと、検索コストや trigram プランも確認できます。
+`--json` returns one JSON object per match line.
+`--stats` and `--explain` show the search cost and the trigram plan.
 
-エージェントへの指示には、たとえば次のように書けます。
+You can put something like this in the agent's instructions:
 
 ```text
-コード検索には grep / rg ではなく `grix <pattern>` を使うこと。
+Use `grix <pattern>` instead of grep / rg for code search.
 ```
 
-基本的な使い方は ripgrep に近いので、単純な検索ならそのまま置き換えられます。
+Basic usage is close to ripgrep, so simple searches drop in directly.
 
-## 先行プロジェクト
+## Prior art
 
-* [Google Code Search](https://github.com/google/codesearch): Russ Cox の trigram プランナが本プロジェクトの土台です。解説は [Regular Expression Matching with a Trigram Index](https://swtch.com/~rsc/regexp/regexp4.html)。
-* [zoekt](https://github.com/sourcegraph/zoekt): サーバー型の trigram 検索エンジンです。grix はこれをローカルで、セットアップなしに使える形に寄せています。
-* [qgrep](https://github.com/zeux/qgrep)、[ugrep-indexer](https://github.com/Genivia/ugrep-indexer): 索引つき grep CLI の先行例です。アーカイブ式やバッチ索引など、grix とは少し違う設計です。
-* [ripgrep](https://github.com/BurntSushi/ripgrep): grix が出力や挙動を合わせる基準にしている検索ツールです。
+* [Google Code Search](https://github.com/google/codesearch): Russ Cox's trigram planner is the basis for this project. Essay: [Regular Expression Matching with a Trigram Index](https://swtch.com/~rsc/regexp/regexp4.html)
+* [zoekt](https://github.com/sourcegraph/zoekt): a server-side trigram search engine. grix aims at the local, zero-setup version of the idea.
+* [qgrep](https://github.com/zeux/qgrep), [ugrep-indexer](https://github.com/Genivia/ugrep-indexer): earlier indexed grep CLIs, with different designs (archive-based, batch indexing).
+* [ripgrep](https://github.com/BurntSushi/ripgrep): the search tool grix matches its output and behavior against.
 
-## ライセンス
+## License
 
 MIT

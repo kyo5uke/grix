@@ -42,7 +42,7 @@ jobs:
           name=grix-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$name"
           cp target/${{ matrix.target }}/release/grix "$name/"
-          cp README.md README.en.md LICENSE "$name/"
+          cp README.md README.ja.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
       - name: Package (zip)
@@ -52,7 +52,7 @@ jobs:
           $name = "grix-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target/${{ matrix.target }}/release/grix.exe $name/
-          Copy-Item README.md,README.en.md,LICENSE $name/
+          Copy-Item README.md,README.ja.md,LICENSE $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           "ARCHIVE=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Upload to release
