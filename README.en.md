@@ -36,11 +36,19 @@ There is a property test that checks indexed search and a full scan return the
 same results, and the benchmark script stops if the two tools' match counts
 differ.
 
+## Install
+
+```bash
+cargo install grix              # build from source
+cargo binstall grix             # fetch a prebuilt binary
+brew install kyo5uke/tap/grix   # macOS / Linux
+```
+
+Prebuilt binaries (including Windows) are also on the [Releases](https://github.com/kyo5uke/grix/releases) page.
+
 ## Usage
 
 ```bash
-cargo install grix
-
 cd your-repo
 grix 'fn main'            # first run builds the index; every run refreshes it
 grix 'fn main' src/       # limit the search to a directory or file

@@ -1,6 +1,6 @@
 [package]
 name = "grix"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["kyosuke <h.kyosuke0505@gmail.com>"]
 description = "grep with an index: trigram-indexed code search that answers in milliseconds"
@@ -10,6 +10,17 @@ readme = "README.md"
 keywords = ["grep", "search", "index", "trigram", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 rust-version = "1.74"
+
+# Install a prebuilt binary with `cargo binstall grix`. URLs match the names
+# produced by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 regex = "1"
