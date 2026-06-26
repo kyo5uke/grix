@@ -1,4 +1,4 @@
-use grix::{index, search, store, watch};
+use grix::{index, mcp, search, store, watch};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,8 @@ USAGE:
     grix index [PATH]                  build or refresh the index
     grix watch [PATH]                  keep the index fresh in the background
                                         (searches then stay instant + current)
+    grix mcp                           run an MCP server (code search for AI
+                                        coding agents); see README
     grix status [PATH]                 show index info
     grix forget [PATH]                 delete the index
 
@@ -77,6 +79,7 @@ enum Cmd {
     Search,
     Index,
     Watch,
+    Mcp,
     Status,
     Forget,
 }
@@ -203,6 +206,9 @@ fn parse_args() -> Result<Cli, String> {
         Some("watch") => {
             cli.command = Cmd::Watch;
             cli.path = positionals.get(1).map(PathBuf::from);
+        }
+        Some("mcp") => {
+            cli.command = Cmd::Mcp;
         }
         Some("status") => {
             cli.command = Cmd::Status;
@@ -687,6 +693,9 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Cmd::Index => cmd_index(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Watch => cmd_watch(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
+        Cmd::Mcp => mcp::run()
+            .map(|()| ExitCode::SUCCESS)
+            .map_err(|e| format!("mcp server failed: {e}")),
         Cmd::Status => cmd_status(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Forget => cmd_forget(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Search => cmd_search(&cli),

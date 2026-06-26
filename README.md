@@ -174,20 +174,48 @@ open an issue.
 
 ## Using it with AI coding agents
 
-AI coding agents run grep against the same tree over and over.
-Pointing them at grix instead of reading every file each time cuts the search
-wait noticeably.
+AI coding agents run grep against the same tree over and over — often hundreds
+of times in one session. grix turns each of those into an index lookup instead
+of a full re-read, and `grix mcp` exposes that as a tool the agent calls
+directly.
 
-`--json` returns one JSON object per match line.
-`--stats` and `--explain` show the search cost and the trigram plan.
+### MCP server
 
-You can put something like this in the agent's instructions:
+`grix mcp` is a [Model Context Protocol](https://modelcontextprotocol.io)
+server over stdio. It exposes two tools — `code_search` (regex search, returns
+`path:line:text`) and `list_matching_files` (cheap recon) — and keeps the index
+fresh in the background while it runs, so every search is instant *and* current.
+
+Claude Code:
+
+```bash
+claude mcp add grix -- grix mcp
+```
+
+Cursor / Windsurf / any MCP client (`mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "grix": { "command": "grix", "args": ["mcp"] }
+  }
+}
+```
+
+Run the server from the repository you want searched (the working directory is
+the search root). The results are exactly what grep would print, so the agent
+gets precise call sites, not approximate matches.
+
+### Or just the CLI
+
+Without MCP, point the agent at the command:
 
 ```text
 Use `grix <pattern>` instead of grep / rg for code search.
 ```
 
-Basic usage is close to ripgrep, so simple searches drop in directly.
+`--json` returns one JSON object per match line; basic usage is argument-
+compatible with ripgrep, so simple searches drop in directly.
 
 ## Prior art
 

@@ -1,6 +1,6 @@
 [package]
 name = "grix"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["kyosuke <h.kyosuke0505@gmail.com>"]
 description = "grep with an index: trigram-indexed code search that answers in milliseconds"
@@ -29,6 +29,7 @@ memmap2 = "0.9"
 ignore = "0.4"
 memchr = "2"
 notify = "6"
+serde_json = "1"
 
 [profile.release]
 lto = true

@@ -405,3 +405,72 @@ fn watch_marker_controls_refresh() {
     let out = run(&["status"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("watch:    off"));
 }
+
+/// Drive the MCP server over stdio with a real JSON-RPC session and check the
+/// handshake, tool list, and a tool call. stdout must be JSON-RPC only.
+#[test]
+fn mcp_server_speaks_jsonrpc() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let exe = env!("CARGO_BIN_EXE_grix");
+    let fx = fixture();
+    let data_dir = fx.root.join(".grix-data");
+
+    let mut child = Command::new(exe)
+        .arg("mcp")
+        .env("GRIX_DATA_DIR", &data_dir)
+        .current_dir(&fx.root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let session = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_search","arguments":{"pattern":"foo","type":"md"}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"code_search","arguments":{"pattern":"f(oo"}}}"#,
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for line in session {
+            writeln!(stdin, "{line}").unwrap();
+        }
+        // dropping stdin (end of this block) sends EOF so the server exits
+    }
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Every non-empty stdout line must be a JSON-RPC object (no log leakage).
+    let mut by_id = std::collections::HashMap::new();
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("non-JSON on stdout: {line}"));
+        assert_eq!(v["jsonrpc"], "2.0");
+        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+            by_id.insert(id, v);
+        }
+    }
+
+    // initialize
+    assert_eq!(by_id[&1]["result"]["serverInfo"]["name"], "grix");
+    // tools/list has both tools
+    let names: Vec<&str> = by_id[&2]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"code_search") && names.contains(&"list_matching_files"));
+    // code_search found "foo" in the markdown doc, not an error
+    let text = by_id[&3]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("docs/guide.md"), "search result: {text}");
+    assert_eq!(by_id[&3]["result"]["isError"], false);
+    // a bad pattern is reported as a tool error, not a protocol error
+    assert_eq!(by_id[&4]["result"]["isError"], true);
+}

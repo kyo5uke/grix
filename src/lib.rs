@@ -1,4 +1,5 @@
 pub mod index;
+pub mod mcp;
 pub mod plan;
 pub mod search;
 pub mod store;
