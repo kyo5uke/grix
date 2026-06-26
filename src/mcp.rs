@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::index::build::{self, BuildOptions};
+use crate::index::build::BuildOptions;
 use crate::index::format::IndexReader;
 use crate::search::{self, FileResult, SearchOptions};
 use crate::{store, watch};
@@ -30,10 +30,10 @@ pub fn run() -> io::Result<()> {
         std::fs::create_dir_all(p)?;
     }
 
-    // Build up front so the first tool call is instant, then keep it fresh in
-    // the background. Per-call searches read the live index and skip the walk.
-    let old = IndexReader::open(&idx).ok();
-    let _ = build::build(&root, &idx, old.as_ref(), &BuildOptions::default());
+    // Build and keep the index fresh in a background thread so the MCP
+    // handshake stays instant even on a large repo (a synchronous build here
+    // would block `initialize`). Until the first build lands, searches fall
+    // back to a full walk — correct, just not yet index-fast.
     {
         let (root2, idx2) = (root.clone(), idx.clone());
         std::thread::spawn(move || {
