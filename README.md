@@ -57,13 +57,24 @@ grix -t rust 'fn main'    # filter by file type (or -g '*.rs')
 grix --no-auto-index 'fn main'  # use the index as-is, no refresh (fastest, may be stale)
 ```
 
-Each search refreshes the index first, so results are always up to date.
-Unchanged files are not re-read (matched by size and mtime), so a refresh is
-mostly just a directory walk.
-For the fastest path that uses the existing index as-is, pass `--no-auto-index`.
+By default each search refreshes the index first, so results are always up to
+date. Unchanged files are not re-read (matched by size and mtime), so a refresh
+is mostly just a directory walk. For the fastest path that uses the existing
+index as-is, pass `--no-auto-index`.
 
-No daemon, no config file.
-Nothing to download, no model.
+### Watch mode — instant *and* always fresh
+
+```bash
+grix watch    # leave running in a terminal (or background it)
+```
+
+`grix watch` keeps the index current in the background using filesystem events,
+reindexing only what changes. While it runs, searches skip the per-search walk
+entirely and are still up to date — you get the `--no-auto-index` speed without
+the staleness. Stop it with Ctrl-C; if it ever dies, searches just resume
+refreshing themselves.
+
+No config file. Nothing to download, no model.
 
 The index is stored under your cache directory.
 

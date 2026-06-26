@@ -1,4 +1,4 @@
-use grix::{index, search, store};
+use grix::{index, search, store, watch};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ USAGE:
                                         the index, on each run); PATH... limits
                                         the search to those files/directories
     grix index [PATH]                  build or refresh the index
+    grix watch [PATH]                  keep the index fresh in the background
+                                        (searches then stay instant + current)
     grix status [PATH]                 show index info
     grix forget [PATH]                 delete the index
 
@@ -74,6 +76,7 @@ struct Cli {
 enum Cmd {
     Search,
     Index,
+    Watch,
     Status,
     Forget,
 }
@@ -197,6 +200,10 @@ fn parse_args() -> Result<Cli, String> {
             cli.command = Cmd::Index;
             cli.path = positionals.get(1).map(PathBuf::from);
         }
+        Some("watch") => {
+            cli.command = Cmd::Watch;
+            cli.path = positionals.get(1).map(PathBuf::from);
+        }
         Some("status") => {
             cli.command = Cmd::Status;
             cli.path = positionals.get(1).map(PathBuf::from);
@@ -268,6 +275,13 @@ fn cmd_index(path: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_watch(path: Option<&Path>) -> Result<(), String> {
+    let root = store::canonical_root(path.unwrap_or(Path::new(".")))
+        .map_err(|e| format!("cannot resolve path: {e}"))?;
+    let idx = store::index_path(&root).map_err(|e| e.to_string())?;
+    watch::run(&root, &idx, &BuildOptions::default()).map_err(|e| format!("watch failed: {e}"))
+}
+
 fn cmd_status(path: Option<&Path>) -> Result<(), String> {
     let start = path.unwrap_or(Path::new("."));
     match store::find_index_upward(start) {
@@ -279,6 +293,14 @@ fn cmd_status(path: Option<&Path>) -> Result<(), String> {
             println!("files:    {}", human_count(reader.file_count()));
             println!("trigrams: {}", human_count(reader.trigram_count()));
             println!("size:     {}", human_bytes(size));
+            println!(
+                "watch:    {}",
+                if store::watcher_is_live(&idx) {
+                    "live (index kept fresh in the background)"
+                } else {
+                    "off (searches refresh the index themselves)"
+                }
+            );
             Ok(())
         }
         None => {
@@ -515,6 +537,9 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     }
 
     let t0 = Instant::now();
+    // Set when a live `grix watch` daemon owns freshness for this index, so we
+    // neither refresh nor warn about staleness below.
+    let mut watcher_live = false;
     let (results, stats) = if cli.no_index {
         let root =
             store::canonical_root(&anchor).map_err(|e| format!("cannot resolve path: {e}"))?;
@@ -530,8 +555,10 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
                 // searching so files added/changed since the last build are
                 // picked up. Unchanged files are reused (no re-read), so this
                 // is a directory walk + stat, not a full rebuild. Skipped with
-                // --no-auto-index for the fastest, use-as-is path.
-                if !cli.no_auto_index {
+                // --no-auto-index, or when a `grix watch` daemon is already
+                // keeping the index fresh (then the walk is pure waste).
+                watcher_live = store::watcher_is_live(&idx);
+                if !cli.no_auto_index && !watcher_live {
                     let old = IndexReader::open(&idx).ok();
                     let t = Instant::now();
                     match build::build(&root, &idx, old.as_ref(), &BuildOptions::default()) {
@@ -636,8 +663,9 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     if results.is_empty() {
         // With --no-auto-index we used the index as-is; a 0-result here might
         // just mean the index is stale. Say so instead of looking like a
-        // definitive "not found".
-        if cli.no_auto_index && !cli.no_index && stats.files_in_index > 0 {
+        // definitive "not found". (A live watcher keeps it fresh, so skip the
+        // hint then.)
+        if cli.no_auto_index && !cli.no_index && !watcher_live && stats.files_in_index > 0 {
             eprintln!(
                 "grix: no matches (index used as-is via --no-auto-index; it may be stale - run `grix index` or drop the flag to auto-refresh)"
             );
@@ -658,6 +686,7 @@ fn main() -> ExitCode {
     };
     let result = match cli.command {
         Cmd::Index => cmd_index(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
+        Cmd::Watch => cmd_watch(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Status => cmd_status(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Forget => cmd_forget(cli.path.as_deref()).map(|()| ExitCode::SUCCESS),
         Cmd::Search => cmd_search(&cli),

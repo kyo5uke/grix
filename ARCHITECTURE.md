@@ -141,10 +141,31 @@ Files over 8 MiB are mmap'd instead of read.
 Output mirrors ripgrep: headings on a tty, `path:line:text` when piped,
 `--json` for machines, exit codes 0/1/2 (match/no match/error).
 
+## Watch mode
+
+By default a search refreshes the index first (a directory walk + stat; only
+changed files are re-read). On a large tree that walk is the dominant cost, so
+the `--no-auto-index` numbers above represent pure query speed but can be
+stale. `grix watch` removes that tension:
+
+1. It subscribes to filesystem events for the tree
+   ([`notify`](https://docs.rs/notify): inotify / FSEvents / ReadDirectoryChangesW).
+2. Events are filtered (gitignore + `.git`) so build churn like `target/`
+   doesn't trigger work, then **debounced** — after ~400 ms of quiet it runs
+   the same incremental build, re-reading only what changed.
+3. It writes a heartbeat to a sidecar file next to the index. A normal
+   `grix <pattern>` checks that heartbeat: if a watcher is alive it **skips its
+   own refresh** and trusts the live index — instant *and* fresh.
+
+The heartbeat is a freshness timestamp, not a lock: if the watcher crashes the
+heartbeat goes stale within seconds and searches transparently resume
+refreshing themselves. Nothing in the repository is touched.
+
 ## What grix does not do (yet)
 
-- **Watch mode**: a daemon updating the index on file events, closing the
-  freshness gap entirely.
 - **Sub-file granularity**: posting lists reference whole files; very large
   uniform corpora would benefit from chunk-level postings.
-- **Multiline patterns** (`-U`), context lines (`-A/-B/-C`), replacements.
+- **Incremental on-disk index**: a watch reindex rewrites the whole index
+  file. Cheap for typical repos; a true incremental format would help on
+  giant trees.
+- **Multiline patterns** (`-U`) and replacements.

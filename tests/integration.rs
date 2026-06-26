@@ -345,3 +345,63 @@ fn binary_smoke_exit_codes() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("stale"));
 }
+
+/// A fresh watch marker makes a normal search skip its refresh (it trusts the
+/// daemon to keep the index current) — and not warn about staleness. Removing
+/// the marker restores self-refresh. This pins the search-side integration
+/// without depending on filesystem-event timing.
+#[test]
+fn watch_marker_controls_refresh() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let exe = env!("CARGO_BIN_EXE_grix");
+    let fx = fixture();
+    let data_dir = fx.root.join(".grix-data");
+
+    let run = |args: &[&str]| {
+        std::process::Command::new(exe)
+            .args(args)
+            .env("GRIX_DATA_DIR", &data_dir)
+            .current_dir(&fx.root)
+            .output()
+            .unwrap()
+    };
+
+    // Build the index once.
+    let out = run(&["index"]);
+    assert_eq!(out.status.code(), Some(0));
+
+    let gix = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "gix"))
+        .expect("index file");
+    let marker = gix.with_extension("watch");
+
+    // Add a file the index does not know about yet.
+    std::fs::write(fx.root.join("watched.rs"), b"const WATCHED_TOK: u8 = 0;\n").unwrap();
+
+    // Fresh marker present -> search trusts it, skips refresh, misses the new
+    // file, and does NOT print a stale hint.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    std::fs::write(&marker, format!("4242\n{now}\n")).unwrap();
+    let out = run(&["WATCHED_TOK", "--color", "never", "--no-heading"]);
+    assert_eq!(out.status.code(), Some(1), "marker should suppress refresh");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("stale"),
+        "no stale hint while a watcher is live"
+    );
+
+    // Remove the marker -> normal refresh kicks in and finds the file.
+    std::fs::remove_file(&marker).unwrap();
+    let out = run(&["WATCHED_TOK", "--color", "never", "--no-heading"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("watched.rs"));
+
+    // status reflects watcher state (off after marker removed).
+    let out = run(&["status"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("watch:    off"));
+}

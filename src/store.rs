@@ -3,6 +3,11 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A live watcher is considered fresh if its heartbeat is newer than this.
+/// `grix watch` refreshes the heartbeat well within this window.
+const WATCH_FRESH_MS: u64 = 30_000;
 
 pub fn data_dir() -> io::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("GRIX_DATA_DIR") {
@@ -73,6 +78,56 @@ pub fn find_index_upward(start: &Path) -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+// ---- watch marker ----
+//
+// `grix watch` keeps the index fresh in the background; a sidecar file next to
+// the index records a heartbeat so `grix <pattern>` can skip its own refresh
+// while a watcher is alive. The heartbeat (not a lock) means a crashed watcher
+// simply goes stale and searches resume self-refreshing.
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn watch_marker_path(index_path: &Path) -> PathBuf {
+    index_path.with_extension("watch")
+}
+
+/// Write/refresh the watcher heartbeat (`pid\nmillis`).
+pub fn write_watch_heartbeat(index_path: &Path) -> io::Result<()> {
+    std::fs::write(
+        watch_marker_path(index_path),
+        format!("{}\n{}\n", std::process::id(), now_millis()),
+    )
+}
+
+pub fn remove_watch_marker(index_path: &Path) {
+    let _ = std::fs::remove_file(watch_marker_path(index_path));
+}
+
+/// True if a watcher refreshed the marker within the freshness window.
+pub fn watcher_is_live(index_path: &Path) -> bool {
+    let Ok(s) = std::fs::read_to_string(watch_marker_path(index_path)) else {
+        return false;
+    };
+    watcher_is_live_at(&s, now_millis())
+}
+
+/// Testable core: is the marker's heartbeat fresh relative to `now`?
+fn watcher_is_live_at(marker: &str, now: u64) -> bool {
+    let Some(hb) = marker
+        .lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    now >= hb && now - hb < WATCH_FRESH_MS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +143,24 @@ mod tests {
         let a = root_key(Path::new(r"C:\repo\x"));
         let b = root_key(Path::new("C:/repo/x"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn watch_liveness() {
+        // fresh heartbeat -> live
+        let m = format!("1234\n{}\n", 100_000);
+        assert!(watcher_is_live_at(&m, 100_000 + 5_000)); // 5s old
+        assert!(!watcher_is_live_at(&m, 100_000 + 40_000)); // 40s old -> stale
+        assert!(!watcher_is_live_at(&m, 100_000 - 1)); // clock went backwards
+                                                       // malformed markers -> not live
+        assert!(!watcher_is_live_at("", 100_000));
+        assert!(!watcher_is_live_at("1234\n", 100_000));
+        assert!(!watcher_is_live_at("1234\nnotanumber\n", 100_000));
+    }
+
+    #[test]
+    fn marker_path_sidecar() {
+        let p = watch_marker_path(Path::new("/cache/abc.gix"));
+        assert_eq!(p, Path::new("/cache/abc.watch"));
     }
 }
