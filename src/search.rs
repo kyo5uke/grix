@@ -447,6 +447,60 @@ fn expand_context(
     out
 }
 
+/// Confirming scan of candidate files, in parallel over a work-stealing pool.
+/// Returns matched results (sorted by path) and how many files were scanned.
+/// Shared by the indexed and the index-less (walk) search paths.
+fn scan_targets(
+    root: &Path,
+    targets: &[(u32, String, u64)],
+    matcher: &Matcher,
+    opts: &SearchOptions,
+) -> (Vec<FileResult>, usize) {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
+    let scanned = AtomicUsize::new(0);
+    let nthreads = opts.threads.max(1).min(targets.len().max(1));
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| {
+                let mut local: Vec<FileResult> = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((_, rel, size)) = targets.get(i) else {
+                        break;
+                    };
+                    let abs = root.join(rel);
+                    let Ok(data) = load(&abs, *size) else {
+                        continue; // vanished since indexing
+                    };
+                    scanned.fetch_add(1, Ordering::Relaxed);
+                    if trigram::looks_binary(&data) {
+                        continue;
+                    }
+                    let lines = scan_buffer_ctx(
+                        &matcher.regex,
+                        &data,
+                        opts.matches_only,
+                        opts.max_count,
+                        opts.before,
+                        opts.after,
+                    );
+                    if !lines.is_empty() {
+                        local.push(FileResult {
+                            rel_path: rel.clone(),
+                            lines,
+                        });
+                    }
+                }
+                results.lock().unwrap().extend(local);
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    (results, scanned.load(Ordering::Relaxed))
+}
+
 /// Search using an index. Returns per-file results sorted by path.
 pub fn search_index(
     reader: &IndexReader,
@@ -500,51 +554,9 @@ pub fn search_index(
 
     // Parallel confirming scan.
     let t1 = Instant::now();
-    let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
-    let scanned = AtomicUsize::new(0);
-    let nthreads = opts.threads.max(1).min(targets.len().max(1));
-    std::thread::scope(|s| {
-        for _ in 0..nthreads {
-            s.spawn(|| {
-                let mut local: Vec<FileResult> = Vec::new();
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((_, rel, size)) = targets.get(i) else {
-                        break;
-                    };
-                    let abs = root.join(rel);
-                    let Ok(data) = load(&abs, *size) else {
-                        continue; // vanished since indexing
-                    };
-                    scanned.fetch_add(1, Ordering::Relaxed);
-                    if trigram::looks_binary(&data) {
-                        continue;
-                    }
-                    let lines = scan_buffer_ctx(
-                        &matcher.regex,
-                        &data,
-                        opts.matches_only,
-                        opts.max_count,
-                        opts.before,
-                        opts.after,
-                    );
-                    if !lines.is_empty() {
-                        local.push(FileResult {
-                            rel_path: rel.clone(),
-                            lines,
-                        });
-                    }
-                }
-                results.lock().unwrap().extend(local);
-            });
-        }
-    });
+    let (results, files_scanned) = scan_targets(root, &targets, matcher, opts);
     stats.scan_micros = t1.elapsed().as_micros();
-    stats.files_scanned = scanned.load(Ordering::Relaxed);
-
-    let mut results = results.into_inner().unwrap();
-    results.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    stats.files_scanned = files_scanned;
     stats.files_matched = results.len();
     stats.lines_matched = results
         .iter()
@@ -588,51 +600,9 @@ pub fn search_walk(
     stats.candidates = targets.len();
 
     let t1 = Instant::now();
-    let next = AtomicUsize::new(0);
-    let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
-    let scanned = AtomicUsize::new(0);
-    let nthreads = opts.threads.max(1).min(targets.len().max(1));
-    std::thread::scope(|s| {
-        for _ in 0..nthreads {
-            s.spawn(|| {
-                let mut local: Vec<FileResult> = Vec::new();
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((_, rel, size)) = targets.get(i) else {
-                        break;
-                    };
-                    let abs = root.join(rel);
-                    let Ok(data) = load(&abs, *size) else {
-                        continue;
-                    };
-                    scanned.fetch_add(1, Ordering::Relaxed);
-                    if trigram::looks_binary(&data) {
-                        continue;
-                    }
-                    let lines = scan_buffer_ctx(
-                        &matcher.regex,
-                        &data,
-                        opts.matches_only,
-                        opts.max_count,
-                        opts.before,
-                        opts.after,
-                    );
-                    if !lines.is_empty() {
-                        local.push(FileResult {
-                            rel_path: rel.clone(),
-                            lines,
-                        });
-                    }
-                }
-                results.lock().unwrap().extend(local);
-            });
-        }
-    });
+    let (results, files_scanned) = scan_targets(root, &targets, matcher, opts);
     stats.scan_micros = t1.elapsed().as_micros();
-    stats.files_scanned = scanned.load(Ordering::Relaxed);
-
-    let mut results = results.into_inner().unwrap();
-    results.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    stats.files_scanned = files_scanned;
     stats.files_matched = results.len();
     stats.lines_matched = results
         .iter()
