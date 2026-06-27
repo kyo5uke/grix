@@ -19,7 +19,10 @@ use crate::index::format::IndexReader;
 use crate::search::{self, FileResult, SearchOptions};
 use crate::{store, watch};
 
-const DEFAULT_PROTOCOL: &str = "2025-06-18";
+/// Protocol versions we speak. The first is our preferred/latest. The tool
+/// surface is identical across these, so we echo the client's choice when we
+/// know it and otherwise offer our latest — as the spec requires.
+const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_MAX_RESULTS: usize = 200;
 
 pub fn run() -> io::Result<()> {
@@ -87,10 +90,13 @@ type RpcResult = Result<Value, (i64, String)>;
 fn handle(method: &str, params: Option<&Value>, root: &Path, idx: &Path) -> RpcResult {
     match method {
         "initialize" => {
-            let protocol = params
+            let requested = params
                 .and_then(|p| p.get("protocolVersion"))
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_PROTOCOL);
+                .and_then(Value::as_str);
+            let protocol = match requested {
+                Some(v) if SUPPORTED_PROTOCOLS.contains(&v) => v,
+                _ => SUPPORTED_PROTOCOLS[0],
+            };
             Ok(json!({
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {}},

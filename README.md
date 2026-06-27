@@ -186,13 +186,8 @@ server over stdio. It exposes two tools — `code_search` (regex search, returns
 `path:line:text`) and `list_matching_files` (cheap recon) — and keeps the index
 fresh in the background while it runs, so every search is instant *and* current.
 
-Claude Code:
-
-```bash
-claude mcp add grix -- grix mcp
-```
-
-Cursor / Windsurf / any MCP client (`mcp.json`):
+It speaks standard MCP, so any MCP client works. The config is the same
+everywhere — only the file it goes in differs:
 
 ```json
 {
@@ -202,9 +197,16 @@ Cursor / Windsurf / any MCP client (`mcp.json`):
 }
 ```
 
-Run the server from the repository you want searched (the working directory is
-the search root). The results are exactly what grep would print, so the agent
-gets precise call sites, not approximate matches.
+- **Claude Code**: `claude mcp add grix -- grix mcp`
+- **Cursor**: `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global)
+- **Windsurf**: `~/.codeium/windsurf/mcp_config.json`
+- **Cline / Roo Code**: the MCP servers JSON in the extension's settings
+- **Zed**: `settings.json` under `context_servers`
+- **Anything else**: drop the snippet into the client's MCP config
+
+Run the server from the repository you want searched (its working directory is
+the search root). Results are exactly what grep would print, so the agent gets
+precise call sites, not approximate matches.
 
 ### Or just the CLI
 
