@@ -1,0 +1,12 @@
+# Redirect the build toolchain's temp dir into the repo (build-tmp/) so the linker
+# writes its temp files there instead of %Temp%. On this machine (Windows Defender
+# real-time protection) freshly created %Temp% files get locked/denied intermittently,
+# failing the link ("Cannot create temporary file ... Permission denied") — not a
+# disk-space issue. An in-repo temp dir avoids it, and because this config is
+# committed it reproduces identically locally and in CI.
+#
+# `[env]` applies ONLY to processes cargo spawns (rustc -> the linker), so the grix
+# binary itself still uses the real %Temp% at runtime — no runtime impact.
+[env]
+TMP = { value = "build-tmp", relative = true, force = true }
+TEMP = { value = "build-tmp", relative = true, force = true }
