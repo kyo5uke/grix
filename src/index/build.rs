@@ -138,6 +138,9 @@ pub fn build(
     opts: &BuildOptions,
 ) -> io::Result<BuildStats> {
     let mut stats = BuildStats::default();
+    // Reclaim temps a crashed build may have left next to the index (their
+    // names are unique per attempt, so nothing else ever overwrites them).
+    format::sweep_stale_temps(index_path);
     let candidates = collect_candidates(root)?;
     stats.files_total = candidates.len();
 
@@ -334,6 +337,8 @@ struct PostingsAcc {
     payload: usize,
     budget: usize,
     index_path: PathBuf,
+    /// Unique per build attempt so concurrent builds never share shard files.
+    tag: String,
     shards: Vec<PathBuf>,
 }
 
@@ -344,6 +349,7 @@ impl PostingsAcc {
             payload: 0,
             budget: budget.max(1),
             index_path: index_path.to_path_buf(),
+            tag: format::temp_tag(),
             shards: Vec::new(),
         }
     }
@@ -398,9 +404,7 @@ impl PostingsAcc {
     }
 
     fn shard_path(&self, n: usize) -> PathBuf {
-        let mut name = self.index_path.as_os_str().to_os_string();
-        name.push(format!(".shard{n}.{}.tmp", std::process::id()));
-        PathBuf::from(name)
+        format::temp_sibling(&self.index_path, &format!("shard{n}"), &self.tag)
     }
 
     /// Flush the in-memory map as one shard: records of

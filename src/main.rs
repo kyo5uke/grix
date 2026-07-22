@@ -27,6 +27,8 @@ USAGE:
 OPTIONS:
     -i              case-insensitive search
     -F              treat the pattern as a literal string
+    -e <PATTERN>    use PATTERN (needed for patterns starting with '-')
+    --              end of options; everything after is pattern/paths
     -l              list matching files only
     -c              print per-file match counts
     -m <N>          stop after N matching lines per file
@@ -117,7 +119,13 @@ fn parse_args() -> Result<Cli, String> {
     };
     let mut args = std::env::args().skip(1).peekable();
     let mut positionals: Vec<String> = Vec::new();
+    let mut pattern_flag: Option<String> = None;
+    // A subcommand word is only recognized in the very first argument slot.
+    // Once any option (or `--`) precedes it, a leading positional is a
+    // pattern, so `grix -F index` searches for "index" instead of indexing.
+    let mut no_subcommand = false;
     while let Some(arg) = args.next() {
+        let positionals_before = positionals.len();
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -129,6 +137,17 @@ fn parse_args() -> Result<Cli, String> {
             }
             "-i" => cli.case_insensitive = true,
             "-F" => cli.fixed = true,
+            "-e" => {
+                let v = args.next().ok_or("-e needs a pattern")?;
+                pattern_flag = Some(v);
+            }
+            "--" => {
+                if positionals.is_empty() {
+                    no_subcommand = true;
+                }
+                positionals.extend(&mut args);
+                break;
+            }
             "-l" => cli.files_only = true,
             "-c" => cli.counts = true,
             "-m" => {
@@ -188,14 +207,26 @@ fn parse_args() -> Result<Cli, String> {
                     other => return Err(format!("bad --color value: {other}")),
                 };
             }
-            s if s.starts_with('-') && s.len() > 1 && !positionals.is_empty() => {
-                return Err(format!("unknown option: {s}"));
-            }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option: {s}"));
             }
             _ => positionals.push(arg),
         }
+        if positionals.len() == positionals_before && positionals_before == 0 {
+            no_subcommand = true; // an option came before any positional
+        }
+    }
+
+    if pattern_flag.is_some() || no_subcommand {
+        cli.pattern = match pattern_flag {
+            Some(p) => Some(p),
+            None if positionals.is_empty() => {
+                return Err("missing pattern (try --help)".into())
+            }
+            None => Some(positionals.remove(0)),
+        };
+        cli.paths = positionals.iter().map(PathBuf::from).collect();
+        return Ok(cli);
     }
 
     match positionals.first().map(String::as_str) {
@@ -570,7 +601,7 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
                     match build::build(&root, &idx, old.as_ref(), &BuildOptions::default()) {
                         Ok(bstats) if cli.stats => eprintln!(
                             "refresh:     {} changed/new, {} reused in {:.2}s",
-                            human_count(bstats.files_indexed),
+                            human_count(bstats.files_extracted),
                             human_count(bstats.files_reused),
                             t.elapsed().as_secs_f64()
                         ),
@@ -637,7 +668,13 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         counts: cli.counts,
         context: opts.before > 0 || opts.after > 0,
     };
-    printer.print(&results).map_err(|e| e.to_string())?;
+    if let Err(e) = printer.print(&results) {
+        // Downstream closed the pipe (e.g. `grix foo | head`): finish
+        // quietly with the normal exit status, like grep/ripgrep.
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(e.to_string());
+        }
+    }
 
     if cli.stats {
         eprintln!();

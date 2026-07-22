@@ -26,7 +26,11 @@ use crate::store;
 
 /// Quiet period after the last change before reindexing.
 const DEBOUNCE: Duration = Duration::from_millis(400);
-/// How often to refresh the heartbeat while idle.
+/// Upper bound on debounce deferral: even if changes keep arriving faster
+/// than DEBOUNCE (e.g. a log writer), reindex at least this often so a
+/// continuous writer cannot starve the index forever.
+const MAX_PENDING: Duration = Duration::from_secs(5);
+/// How often to refresh the heartbeat.
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 fn human_count(n: usize) -> String {
@@ -97,10 +101,34 @@ pub fn run(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()
         std::fs::create_dir_all(parent)?;
     }
 
+    // Heartbeat on its own thread: a build can take tens of seconds on a
+    // large tree, and a blocked main loop must not let the marker go stale
+    // (concurrent searches would start competing builds and rename-race the
+    // index). The channel doubles as the stop signal — dropping the sender
+    // wakes the thread immediately — and joining *before* removing the
+    // marker guarantees no late beat resurrects it after cleanup.
+    let (hb_stop, hb_rx) = channel::<()>();
+    let hb = {
+        let idx = index_path.to_path_buf();
+        std::thread::spawn(move || loop {
+            let _ = store::write_watch_heartbeat(&idx);
+            match hb_rx.recv_timeout(HEARTBEAT_EVERY) {
+                Err(RecvTimeoutError::Timeout) => continue,
+                _ => break, // stop: sender dropped
+            }
+        })
+    };
+    let result = watch_loop(root, index_path, opts);
+    drop(hb_stop);
+    let _ = hb.join();
+    store::remove_watch_marker(index_path);
+    result
+}
+
+fn watch_loop(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()> {
     // Initial (incremental) build so the index is correct before watching.
     let t = Instant::now();
     let stats = reindex_with_retry(root, index_path, opts)?;
-    store::write_watch_heartbeat(index_path)?;
     eprintln!(
         "grix: watching {} ({} files indexed) — built in {:.2}s. Press Ctrl-C to stop.",
         root.display(),
@@ -124,7 +152,8 @@ pub fn run(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut last_event = Instant::now();
-    let mut last_heartbeat = Instant::now();
+    // When the oldest still-pending change arrived, for the MAX_PENDING cap.
+    let mut first_pending: Option<Instant> = None;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -137,22 +166,31 @@ pub fn run(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()
                     }
                     if !changed.is_empty() {
                         last_event = Instant::now();
+                        first_pending.get_or_insert(last_event);
                     }
                 }
             }
-            Ok(Err(_)) => {} // watch backend error; keep going
+            Ok(Err(e)) => {
+                // A backend error (e.g. ReadDirectoryChangesW buffer
+                // overflow on Windows) can mean dropped events. Schedule a
+                // reindex so nothing stays silently missing: the incremental
+                // build rescans the tree, so it repairs any missed change.
+                eprintln!("grix: watch backend error ({e}); scheduling a reindex");
+                changed.insert(root.to_path_buf());
+                last_event = Instant::now();
+                first_pending.get_or_insert(last_event);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
 
-        if last_heartbeat.elapsed() >= HEARTBEAT_EVERY {
-            let _ = store::write_watch_heartbeat(index_path);
-            last_heartbeat = Instant::now();
-        }
-
-        if !changed.is_empty() && last_event.elapsed() >= DEBOUNCE {
+        let due = !changed.is_empty()
+            && (last_event.elapsed() >= DEBOUNCE
+                || first_pending.is_some_and(|t| t.elapsed() >= MAX_PENDING));
+        if due {
             let n = changed.len();
             changed.clear();
+            first_pending = None;
             let t = Instant::now();
             match reindex_with_retry(root, index_path, opts) {
                 Ok(s) => eprintln!(
@@ -163,11 +201,8 @@ pub fn run(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()
                 ),
                 Err(e) => eprintln!("grix: reindex failed: {e}"),
             }
-            let _ = store::write_watch_heartbeat(index_path);
-            last_heartbeat = Instant::now();
         }
     }
 
-    store::remove_watch_marker(index_path);
     Ok(())
 }

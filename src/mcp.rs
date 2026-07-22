@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::index::build::BuildOptions;
+use crate::index::build::{self, BuildOptions};
 use crate::index::format::IndexReader;
 use crate::search::{self, FileResult, SearchOptions};
 use crate::{store, watch};
@@ -228,6 +228,16 @@ fn do_search(
     matcher: &search::Matcher,
     opts: &SearchOptions,
 ) -> Result<Vec<FileResult>, String> {
+    // The background watcher normally owns freshness. If it died (notify
+    // init failure, fatal build error, …) its heartbeat goes stale; refresh
+    // here so results never stay pinned to the moment the watcher stopped.
+    // An unchanged tree makes this a walk + stat, not a rebuild.
+    if !store::watcher_is_live(idx) {
+        let old = IndexReader::open(idx).ok();
+        if let Err(e) = build::build(root, idx, old.as_ref(), &BuildOptions::default()) {
+            eprintln!("grix mcp: index refresh skipped ({e})");
+        }
+    }
     match IndexReader::open(idx) {
         Ok(reader) => search::search_index(&reader, root, matcher, opts)
             .map(|(r, _)| r)

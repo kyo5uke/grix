@@ -541,6 +541,9 @@ pub fn plan(pattern: &str, case_insensitive: bool) -> Result<Query, Box<regex_sy
     let hir = regex_syntax::ParserBuilder::new()
         .case_insensitive(case_insensitive)
         .multi_line(true)
+        // Trigrams are byte-based, so accept byte-oriented patterns like
+        // (?-u)\xff that the regex crate itself accepts.
+        .utf8(false)
         .build()
         .parse(pattern)
         .map_err(Box::new)?;

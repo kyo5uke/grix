@@ -15,7 +15,9 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use memmap2::Mmap;
 
@@ -24,6 +26,69 @@ use crate::varint;
 pub const MAGIC: &[u8; 8] = b"GRIXIDX1";
 pub const VERSION: u32 = 1;
 const HEADER_LEN: usize = 96;
+
+/// Leftover temps from a crashed build are collected once they are this old.
+/// Far longer than any live build, so an in-flight sibling is never touched.
+const TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Tag making temp names unique per build attempt. Concurrent builds of the
+/// same index (parallel searches, watcher + search, another process) must
+/// never share a temp path — interleaved writes through separate handles
+/// would install a corrupt index. With unique names, whichever build renames
+/// last wins with a complete file.
+pub(crate) fn temp_tag() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// `<index file>.<kind>.<tag>.tmp` next to the index — same directory, so
+/// the final rename stays on one volume and atomic.
+pub(crate) fn temp_sibling(index_path: &Path, kind: &str, tag: &str) -> PathBuf {
+    let mut name = index_path.as_os_str().to_os_string();
+    name.push(format!(".{kind}.{tag}.tmp"));
+    PathBuf::from(name)
+}
+
+/// Delete stale build temps (`<index file>.*.tmp`) left behind by crashed
+/// builds; uniquely-named temps are never overwritten, so without a sweep
+/// they would accumulate.
+pub(crate) fn sweep_stale_temps(index_path: &Path) {
+    sweep_stale_temps_older_than(index_path, TEMP_MAX_AGE);
+}
+
+fn sweep_stale_temps_older_than(index_path: &Path, max_age: Duration) {
+    let Some(dir) = index_path.parent() else {
+        return;
+    };
+    let Some(file_name) = index_path.file_name() else {
+        return;
+    };
+    let prefix = format!("{}.", file_name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok()) // future mtime -> Err -> keep
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// File was too large to index; search must always scan it.
 pub const FLAG_SCAN_ALWAYS: u32 = 1;
@@ -75,8 +140,9 @@ pub fn write_index(
     files: &[FileRecord],
     postings: impl Iterator<Item = io::Result<(u32, Vec<u32>)>>,
 ) -> io::Result<()> {
-    let tmp = path.with_extension("gix.tmp");
-    let post_tmp = path.with_extension("gix.post.tmp");
+    let tag = temp_tag();
+    let tmp = temp_sibling(path, "new", &tag);
+    let post_tmp = temp_sibling(path, "post", &tag);
     let res = write_index_streamed(&tmp, &post_tmp, root, files, postings).and_then(|()| {
         // Atomic-ish replace.
         match std::fs::rename(&tmp, path) {
@@ -462,5 +528,61 @@ mod tests {
         let idx = dir.path().join("bad.gix");
         std::fs::write(&idx, b"not an index at all").unwrap();
         assert!(IndexReader::open(&idx).is_err());
+    }
+
+    fn temp_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn failed_write_keeps_index_and_leaves_no_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("t.gix");
+        let files = sample_files();
+        let mut postings = BTreeMap::new();
+        postings.insert(crate::trigram::pack_str(b"abc"), vec![0u32]);
+        write_index(&idx, "r", &files, postings.into_iter().map(Ok)).unwrap();
+        assert!(temp_leftovers(dir.path()).is_empty());
+
+        let boom = std::iter::once(Err(io::Error::other("boom")));
+        assert!(write_index(&idx, "r", &files, boom).is_err());
+        // The failed attempt must not clobber the live index nor leave temps.
+        assert!(IndexReader::open(&idx).is_ok());
+        assert!(
+            temp_leftovers(dir.path()).is_empty(),
+            "{:?}",
+            temp_leftovers(dir.path())
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_matching_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("k.gix");
+        std::fs::write(&idx, b"index").unwrap();
+        let marker = dir.path().join("k.watch");
+        std::fs::write(&marker, b"hb").unwrap();
+        let ours = dir.path().join("k.gix.post.999-0.tmp");
+        std::fs::write(&ours, b"junk").unwrap();
+        let other_index = dir.path().join("other.gix.new.1-1.tmp");
+        std::fs::write(&other_index, b"junk").unwrap();
+
+        // Zero age: everything of ours qualifies; the index, the watch
+        // marker and other indexes' temps must survive.
+        std::thread::sleep(Duration::from_millis(20));
+        sweep_stale_temps_older_than(&idx, Duration::ZERO);
+        assert!(!ours.exists());
+        assert!(idx.exists() && marker.exists() && other_index.exists());
+
+        // Default age: a fresh temp (a build in flight) survives.
+        let fresh = dir.path().join("k.gix.shard0.1-2.tmp");
+        std::fs::write(&fresh, b"junk").unwrap();
+        sweep_stale_temps(&idx);
+        assert!(fresh.exists());
     }
 }

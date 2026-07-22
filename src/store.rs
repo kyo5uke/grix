@@ -44,9 +44,20 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// strip Windows' verbatim prefix, fold case on Windows.
 pub fn canonical_root(path: &Path) -> io::Result<PathBuf> {
     let c = std::fs::canonicalize(path)?;
-    let s = c.to_string_lossy();
-    let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-    Ok(PathBuf::from(s))
+    Ok(PathBuf::from(strip_verbatim(&c.to_string_lossy())))
+}
+
+/// Remove Windows' verbatim prefix while keeping the path usable:
+/// `\\?\C:\x` -> `C:\x`, and `\\?\UNC\server\share\x` -> `\\server\share\x`
+/// (naively stripping the latter would leave a relative-looking `UNC\...`).
+fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 fn root_key(root: &Path) -> u64 {
@@ -136,6 +147,17 @@ mod tests {
     fn fnv_known_value() {
         // FNV-1a 64 of "a" is a published constant.
         assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
+    }
+
+    #[test]
+    fn verbatim_prefix_stripping() {
+        assert_eq!(strip_verbatim(r"\\?\C:\repo\x"), r"C:\repo\x");
+        assert_eq!(
+            strip_verbatim(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(strip_verbatim(r"C:\repo"), r"C:\repo");
+        assert_eq!(strip_verbatim("/home/x"), "/home/x");
     }
 
     #[test]
