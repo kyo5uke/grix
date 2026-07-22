@@ -7,7 +7,12 @@ grix is a grep that uses a trigram index.
 It indexes a directory tree once, then uses that index to narrow searches to a
 small set of candidate files.
 It runs the real regex on those candidates, so within the features it supports
-it returns the same lines as ripgrep.
+it returns the same lines as ripgrep — exact, not semantic, not RAG.
+
+It pays off most when the same tree is searched over and over — including by AI
+coding agents. `grix mcp` is a Model Context Protocol server, so Claude Code,
+Cursor, and any MCP client can search through the index instead of re-reading
+files.
 
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)

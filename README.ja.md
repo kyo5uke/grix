@@ -5,7 +5,9 @@
 grix は trigram 索引を使う grep です。
 
 初回にディレクトリツリーの索引を作り、次回からはその索引で候補ファイルを絞って検索します。
-候補ファイルには実際に regex を走らせるので、対応している範囲では ripgrep と同じ行を返します。
+候補ファイルには実際に regex を走らせるので、対応している範囲では ripgrep と同じ行を返します（セマンティックでも RAG でもない、厳密一致）。
+
+同じツリーを何度も検索するときほど効きます。AI コーディングエージェントもそうです。`grix mcp` は Model Context Protocol サーバーなので、Claude Code・Cursor・任意の MCP クライアントが、ファイルを再読み込みする代わりに索引越しに検索できます。
 
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
