@@ -65,101 +65,126 @@ impl From<io::Error> for IndexError {
     }
 }
 
-/// Write a complete index. `postings` must map each trigram key to a sorted,
-/// deduplicated list of file ids referencing `files`.
+/// Write a complete index. `postings` must yield each trigram key with its
+/// sorted, deduplicated file ids, in ascending key order. The posting blob
+/// is streamed through a temp file so peak memory stays at one posting list
+/// plus 16 bytes per trigram, independent of index size.
 pub fn write_index(
     path: &Path,
     root: &str,
     files: &[FileRecord],
-    postings: impl ExactSizeIterator<Item = (u32, Vec<u32>)>,
+    postings: impl Iterator<Item = io::Result<(u32, Vec<u32>)>>,
 ) -> io::Result<()> {
     let tmp = path.with_extension("gix.tmp");
-    {
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::with_capacity(1 << 20, f);
-
-        // Lay out variable sections first (offsets are computed up front).
-        let root_off = HEADER_LEN as u64;
-        let root_len = root.len() as u64;
-
-        let paths_off = root_off + root_len;
-        let mut paths_len: u64 = 0;
-        for fr in files {
-            paths_len += fr.rel_path.len() as u64;
+    let post_tmp = path.with_extension("gix.post.tmp");
+    let res = write_index_streamed(&tmp, &post_tmp, root, files, postings).and_then(|()| {
+        // Atomic-ish replace.
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Windows: rename fails if target exists and is open; retry after remove.
+                let _ = std::fs::remove_file(path);
+                std::fs::rename(&tmp, path)
+            }
         }
+    });
+    let _ = std::fs::remove_file(&post_tmp);
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
 
-        let file_table_off = paths_off + paths_len;
-        let file_table_len = files.len() as u64 * 28;
-
-        let tri_table_off = file_table_off + file_table_len;
-        let tri_count = postings.len() as u64;
-        let tri_table_len = tri_count * 16;
-        let postings_off = tri_table_off + tri_table_len;
-
-        // The header needs postings_len up front, so encode postings into
-        // memory first; delta varint keeps this compact relative to the data.
-        let mut tri_table = Vec::with_capacity((tri_table_len as usize).min(1 << 24));
-        let mut post_blob: Vec<u8> = Vec::new();
-        for (key, ids) in postings {
-            let off = post_blob.len() as u64;
+fn write_index_streamed(
+    tmp: &Path,
+    post_tmp: &Path,
+    root: &str,
+    files: &[FileRecord],
+    postings: impl Iterator<Item = io::Result<(u32, Vec<u32>)>>,
+) -> io::Result<()> {
+    // Encode postings first: the header needs the trigram count and blob
+    // length up front. The blob goes to a temp file; only the fixed 16-byte
+    // table entries are kept in memory.
+    let mut tri_table: Vec<u8> = Vec::new();
+    let mut post_len: u64 = 0;
+    {
+        let f = File::create(post_tmp)?;
+        let mut pw = BufWriter::with_capacity(1 << 20, f);
+        let mut buf: Vec<u8> = Vec::new();
+        for item in postings {
+            let (key, ids) = item?;
+            buf.clear();
             let mut prev = 0u32;
             for (i, &id) in ids.iter().enumerate() {
                 let delta = if i == 0 { id } else { id - prev };
-                varint::write_u64(&mut post_blob, u64::from(delta));
+                varint::write_u64(&mut buf, u64::from(delta));
                 prev = id;
             }
-            let len = post_blob.len() as u64 - off;
             tri_table.extend_from_slice(&key.to_le_bytes());
-            tri_table.extend_from_slice(&(len as u32).to_le_bytes());
-            tri_table.extend_from_slice(&off.to_le_bytes());
+            tri_table.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+            tri_table.extend_from_slice(&post_len.to_le_bytes());
+            pw.write_all(&buf)?;
+            post_len += buf.len() as u64;
         }
-
-        // Header.
-        w.write_all(MAGIC)?;
-        w.write_all(&VERSION.to_le_bytes())?;
-        w.write_all(&0u32.to_le_bytes())?; // reserved
-        w.write_all(&(files.len() as u64).to_le_bytes())?;
-        w.write_all(&tri_count.to_le_bytes())?;
-        w.write_all(&file_table_off.to_le_bytes())?;
-        w.write_all(&paths_off.to_le_bytes())?;
-        w.write_all(&paths_len.to_le_bytes())?;
-        w.write_all(&tri_table_off.to_le_bytes())?;
-        w.write_all(&postings_off.to_le_bytes())?;
-        w.write_all(&(post_blob.len() as u64).to_le_bytes())?;
-        w.write_all(&root_off.to_le_bytes())?;
-        w.write_all(&root_len.to_le_bytes())?;
-
-        // Sections.
-        w.write_all(root.as_bytes())?;
-        let mut path_off: u64 = 0;
-        for fr in files {
-            // paths blob
-            w.write_all(fr.rel_path.as_bytes())?;
-            path_off += fr.rel_path.len() as u64;
-        }
-        let _ = path_off;
-        let mut off_acc: u32 = 0;
-        for fr in files {
-            w.write_all(&off_acc.to_le_bytes())?;
-            w.write_all(&(fr.rel_path.len() as u32).to_le_bytes())?;
-            w.write_all(&fr.size.to_le_bytes())?;
-            w.write_all(&fr.mtime.to_le_bytes())?;
-            w.write_all(&fr.flags.to_le_bytes())?;
-            off_acc += fr.rel_path.len() as u32;
-        }
-        w.write_all(&tri_table)?;
-        w.write_all(&post_blob)?;
-        w.flush()?;
+        pw.flush()?;
     }
-    // Atomic-ish replace.
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Windows: rename fails if target exists and is open; retry after remove.
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp, path)
-        }
+    let tri_count = (tri_table.len() / 16) as u64;
+
+    let f = File::create(tmp)?;
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+
+    // Lay out variable sections (all lengths are known now).
+    let root_off = HEADER_LEN as u64;
+    let root_len = root.len() as u64;
+
+    let paths_off = root_off + root_len;
+    let mut paths_len: u64 = 0;
+    for fr in files {
+        paths_len += fr.rel_path.len() as u64;
     }
+
+    let file_table_off = paths_off + paths_len;
+    let file_table_len = files.len() as u64 * 28;
+
+    let tri_table_off = file_table_off + file_table_len;
+    let tri_table_len = tri_count * 16;
+    let postings_off = tri_table_off + tri_table_len;
+
+    // Header.
+    w.write_all(MAGIC)?;
+    w.write_all(&VERSION.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?; // reserved
+    w.write_all(&(files.len() as u64).to_le_bytes())?;
+    w.write_all(&tri_count.to_le_bytes())?;
+    w.write_all(&file_table_off.to_le_bytes())?;
+    w.write_all(&paths_off.to_le_bytes())?;
+    w.write_all(&paths_len.to_le_bytes())?;
+    w.write_all(&tri_table_off.to_le_bytes())?;
+    w.write_all(&postings_off.to_le_bytes())?;
+    w.write_all(&post_len.to_le_bytes())?;
+    w.write_all(&root_off.to_le_bytes())?;
+    w.write_all(&root_len.to_le_bytes())?;
+
+    // Sections.
+    w.write_all(root.as_bytes())?;
+    for fr in files {
+        // paths blob
+        w.write_all(fr.rel_path.as_bytes())?;
+    }
+    let mut off_acc: u32 = 0;
+    for fr in files {
+        w.write_all(&off_acc.to_le_bytes())?;
+        w.write_all(&(fr.rel_path.len() as u32).to_le_bytes())?;
+        w.write_all(&fr.size.to_le_bytes())?;
+        w.write_all(&fr.mtime.to_le_bytes())?;
+        w.write_all(&fr.flags.to_le_bytes())?;
+        off_acc += fr.rel_path.len() as u32;
+    }
+    w.write_all(&tri_table)?;
+    let mut pf = File::open(post_tmp)?;
+    io::copy(&mut pf, &mut w)?;
+    w.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,9 +311,11 @@ impl IndexReader {
         let size = u64::from_le_bytes(buf[e + 8..e + 16].try_into().unwrap());
         let mtime = u64::from_le_bytes(buf[e + 16..e + 24].try_into().unwrap());
         let flags = u32::from_le_bytes(buf[e + 24..e + 28].try_into().unwrap());
-        let p0 = self.paths_off + path_off;
-        let rel_path = buf
-            .get(p0..p0 + path_len)
+        let rel_path = self
+            .paths_off
+            .checked_add(path_off)
+            .and_then(|p0| Some(p0..p0.checked_add(path_len)?))
+            .and_then(|r| buf.get(r))
             .and_then(|b| std::str::from_utf8(b).ok())
             .ok_or(IndexError::Corrupt("bad path entry"))?;
         Ok(FileMeta {
@@ -313,10 +340,7 @@ impl IndexReader {
                 std::cmp::Ordering::Equal => {
                     let len = u32::from_le_bytes(buf[e + 4..e + 8].try_into().unwrap()) as usize;
                     let off = u64::from_le_bytes(buf[e + 8..e + 16].try_into().unwrap()) as usize;
-                    let p0 = self.postings_off + off;
-                    let bytes = buf
-                        .get(p0..p0 + len)
-                        .ok_or(IndexError::Corrupt("postings out of bounds"))?;
+                    let bytes = posting_bytes(buf, self.postings_off, off, len)?;
                     return decode_postings(bytes, self.file_count);
                 }
             }
@@ -332,13 +356,25 @@ impl IndexReader {
             let k = u32::from_le_bytes(buf[e..e + 4].try_into().unwrap());
             let len = u32::from_le_bytes(buf[e + 4..e + 8].try_into().unwrap()) as usize;
             let off = u64::from_le_bytes(buf[e + 8..e + 16].try_into().unwrap()) as usize;
-            let p0 = self.postings_off + off;
-            let bytes = buf
-                .get(p0..p0 + len)
-                .ok_or(IndexError::Corrupt("postings out of bounds"))?;
+            let bytes = posting_bytes(buf, self.postings_off, off, len)?;
             Ok((k, decode_postings(bytes, self.file_count)?))
         })
     }
+}
+
+/// Slice one posting list out of the blob with overflow-checked offsets, so
+/// a corrupt trigram-table entry errors instead of wrapping in release mode.
+fn posting_bytes(
+    buf: &[u8],
+    postings_off: usize,
+    off: usize,
+    len: usize,
+) -> Result<&[u8], IndexError> {
+    postings_off
+        .checked_add(off)
+        .and_then(|p0| Some(p0..p0.checked_add(len)?))
+        .and_then(|r| buf.get(r))
+        .ok_or(IndexError::Corrupt("postings out of bounds"))
 }
 
 fn decode_postings(bytes: &[u8], file_count: usize) -> Result<Vec<u32>, IndexError> {
@@ -398,7 +434,7 @@ mod tests {
         postings.insert(crate::trigram::pack_str(b"abc"), vec![0u32, 2]);
         postings.insert(crate::trigram::pack_str(b"bcd"), vec![1u32]);
         postings.insert(crate::trigram::pack_str(b"zzz"), vec![0u32, 1, 2]);
-        write_index(&idx, "C:/repo", &files, postings.into_iter()).unwrap();
+        write_index(&idx, "C:/repo", &files, postings.into_iter().map(Ok)).unwrap();
 
         let r = IndexReader::open(&idx).unwrap();
         assert_eq!(r.root(), "C:/repo");
