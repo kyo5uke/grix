@@ -149,6 +149,12 @@ pub struct SearchOptions {
     /// Context lines to show before / after each matching line (-B / -A).
     pub before: usize,
     pub after: usize,
+    /// Matches may span line boundaries (-U). Output then covers every line
+    /// the match touches, and -c / -m count matches instead of lines.
+    pub multiline: bool,
+    /// Display-time replacement for matched text (-r), with `$group` refs.
+    /// Files are never modified.
+    pub replace: Option<Vec<u8>>,
     /// Glob filters (-g). A leading `!` excludes; otherwise, the presence of
     /// any positive glob restricts results to files that match one.
     pub globs: Vec<String>,
@@ -242,6 +248,8 @@ impl Default for SearchOptions {
             max_count: None,
             before: 0,
             after: 0,
+            multiline: false,
+            replace: None,
             globs: Vec::new(),
             types_select: Vec::new(),
             types_negate: Vec::new(),
@@ -258,6 +266,10 @@ pub struct MatchLine {
     /// True for a line the pattern actually matched, false for a context line
     /// pulled in by -A/-B/-C.
     pub is_match: bool,
+    /// Number of matches *starting* on this line. Continuation lines of a
+    /// multiline match and context lines carry 0. (`-c` counts matched
+    /// lines normally but whole matches under `-U`, like ripgrep.)
+    pub starts: u32,
 }
 
 #[derive(Debug)]
@@ -440,6 +452,17 @@ fn load(path: &Path, size_hint: u64) -> std::io::Result<FileData> {
     }
 }
 
+/// Per-scan options: the three scanner modes share one signature.
+#[derive(Default)]
+pub struct ScanOpts<'a> {
+    pub matches_only: bool,
+    pub max_count: Option<u64>,
+    pub before: usize,
+    pub after: usize,
+    pub multiline: bool,
+    pub replace: Option<&'a [u8]>,
+}
+
 /// Scan one buffer, collecting matched lines.
 pub fn scan_buffer(
     re: &regex::bytes::Regex,
@@ -447,7 +470,15 @@ pub fn scan_buffer(
     matches_only: bool,
     max_count: Option<u64>,
 ) -> Vec<MatchLine> {
-    scan_buffer_ctx(re, data, matches_only, max_count, 0, 0)
+    scan_buffer_opts(
+        re,
+        data,
+        &ScanOpts {
+            matches_only,
+            max_count,
+            ..Default::default()
+        },
+    )
 }
 
 /// Scan one buffer, collecting matched lines plus `before`/`after` context.
@@ -459,6 +490,47 @@ pub fn scan_buffer_ctx(
     before: usize,
     after: usize,
 ) -> Vec<MatchLine> {
+    scan_buffer_opts(
+        re,
+        data,
+        &ScanOpts {
+            matches_only,
+            max_count,
+            before,
+            after,
+            ..Default::default()
+        },
+    )
+}
+
+/// Full scanner entry point: dispatches to the line-by-line, replacing or
+/// multiline scan, then expands -A/-B/-C context.
+pub fn scan_buffer_opts(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
+    let lines = if o.multiline {
+        scan_multiline(re, data, o)
+    } else if o.replace.is_some() {
+        scan_single_replace(re, data, o)
+    } else {
+        scan_single(re, data, o)
+    };
+    if (o.before == 0 && o.after == 0) || lines.is_empty() {
+        return lines;
+    }
+    expand_context(data, lines, o.before, o.after)
+}
+
+/// The one MatchLine that says "this file matches" (-l / recon calls).
+fn existence() -> Vec<MatchLine> {
+    vec![MatchLine {
+        line_number: 0,
+        spans: Vec::new(),
+        line: Vec::new(),
+        is_match: true,
+        starts: 1,
+    }]
+}
+
+fn scan_single(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
     let mut lines: Vec<MatchLine> = Vec::new();
     let mut line_no: u64 = 1;
     let mut counted_to: usize = 0; // newlines counted up to this offset
@@ -472,15 +544,8 @@ pub fn scan_buffer_ctx(
         if memchr::memchr(b'\n', &data[m.start()..m.end()]).is_some() {
             continue;
         }
-        if matches_only {
-            // Existence is all the caller needs.
-            lines.push(MatchLine {
-                line_number: 0,
-                spans: Vec::new(),
-                line: Vec::new(),
-                is_match: true,
-            });
-            return lines;
+        if o.matches_only {
+            return existence();
         }
         let start = m.start();
         // Count newlines up to the match, tracking the last one so the line
@@ -503,8 +568,9 @@ pub fn scan_buffer_ctx(
             if e > s {
                 last.spans.push((s, e));
             }
+            last.starts += 1;
         } else {
-            if let Some(max) = max_count {
+            if let Some(max) = o.max_count {
                 if lines.len() as u64 >= max {
                     break;
                 }
@@ -516,20 +582,240 @@ pub fn scan_buffer_ctx(
                 spans: if e > s { vec![(s, e)] } else { Vec::new() },
                 line: data[line_start..line_end].to_vec(),
                 is_match: true,
+                starts: 1,
             });
             cur_line = Some((line_start, line_end));
         }
     }
+    lines
+}
 
-    if (before == 0 && after == 0) || lines.is_empty() {
+/// Line-by-line scan with -r: each matched line is rebuilt with every match
+/// replaced by its `$group` expansion, and spans point at the replacements.
+fn scan_single_replace(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
+    let rep = o.replace.unwrap_or(b"");
+    let mut lines: Vec<MatchLine> = Vec::new();
+    let mut line_no: u64 = 1;
+    let mut counted_to: usize = 0;
+    let mut line_anchor: usize = 0;
+    // The line currently being rebuilt.
+    let mut cur: Option<(usize, usize)> = None;
+    let mut cur_no: u64 = 0;
+    let mut rebuilt: Vec<u8> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut starts: u32 = 0;
+    let mut src = 0usize; // absolute position in `data` copied so far
+
+    for caps in re.captures_iter(data) {
+        let m = caps.get(0).unwrap();
+        if memchr::memchr(b'\n', &data[m.start()..m.end()]).is_some() {
+            continue;
+        }
+        if o.matches_only {
+            return existence();
+        }
+        for p in memchr::memchr_iter(b'\n', &data[counted_to..m.start()]) {
+            line_no += 1;
+            line_anchor = counted_to + p + 1;
+        }
+        counted_to = m.start();
+        let ls = line_anchor;
+        let le = memchr::memchr(b'\n', &data[m.start()..]).map_or(data.len(), |p| m.start() + p);
+
+        if cur != Some((ls, le)) {
+            if let Some((_, pe)) = cur.take() {
+                rebuilt.extend_from_slice(&data[src..pe]);
+                lines.push(MatchLine {
+                    line_number: cur_no,
+                    spans: std::mem::take(&mut spans),
+                    line: std::mem::take(&mut rebuilt),
+                    is_match: true,
+                    starts,
+                });
+                starts = 0;
+            }
+            if let Some(max) = o.max_count {
+                if lines.len() as u64 >= max {
+                    return lines;
+                }
+            }
+            cur = Some((ls, le));
+            cur_no = line_no;
+            src = ls;
+        }
+        rebuilt.extend_from_slice(&data[src..m.start()]);
+        let s0 = rebuilt.len();
+        caps.expand(rep, &mut rebuilt);
+        if rebuilt.len() > s0 {
+            spans.push((s0, rebuilt.len()));
+        }
+        starts += 1;
+        src = m.end();
+    }
+    if let Some((_, pe)) = cur {
+        rebuilt.extend_from_slice(&data[src..pe]);
+        lines.push(MatchLine {
+            line_number: cur_no,
+            spans,
+            line: rebuilt,
+            is_match: true,
+            starts,
+        });
+    }
+    lines
+}
+
+/// -U scan: a match may span newlines; every line it touches is emitted
+/// (spans clipped per line). With -r the whole touched region is rebuilt
+/// around the expansion and re-split into lines, like ripgrep. -m counts
+/// matches here, not lines.
+fn scan_multiline(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
+    let mut lines: Vec<MatchLine> = Vec::new();
+    let mut line_no: u64 = 1;
+    let mut counted_to: usize = 0;
+    let mut line_anchor: usize = 0;
+    let mut matches_seen: u64 = 0;
+
+    if let Some(rep) = o.replace {
+        for caps in re.captures_iter(data) {
+            let m = caps.get(0).unwrap();
+            if o.matches_only {
+                return existence();
+            }
+            if let Some(max) = o.max_count {
+                if matches_seen >= max {
+                    break;
+                }
+            }
+            matches_seen += 1;
+            for p in memchr::memchr_iter(b'\n', &data[counted_to..m.start()]) {
+                line_no += 1;
+                line_anchor = counted_to + p + 1;
+            }
+            counted_to = m.start();
+            let ls = line_anchor;
+            // End of the line containing the match's last byte (a match
+            // ending in '\n' does not touch the following line).
+            let last = if m.end() > m.start() {
+                m.end() - 1
+            } else {
+                m.start().min(data.len().saturating_sub(1))
+            };
+            let region_end = memchr::memchr(b'\n', &data[last.min(data.len())..])
+                .map_or(data.len(), |p| last + p);
+
+            let mut rebuilt: Vec<u8> = data[ls..m.start()].to_vec();
+            let s0 = rebuilt.len();
+            caps.expand(rep, &mut rebuilt);
+            let s1 = rebuilt.len();
+            if region_end > m.end() {
+                rebuilt.extend_from_slice(&data[m.end()..region_end]);
+            }
+            // Re-split the rebuilt region; line numbers run on from the
+            // match's first line.
+            let mut off = 0usize;
+            let mut ln = line_no;
+            let mut first = true;
+            loop {
+                let nl = memchr::memchr(b'\n', &rebuilt[off..]);
+                let end = nl.map_or(rebuilt.len(), |p| off + p);
+                let (cs, ce) = (s0.max(off), s1.min(end));
+                lines.push(MatchLine {
+                    line_number: ln,
+                    spans: if ce > cs {
+                        vec![(cs - off, ce - off)]
+                    } else {
+                        Vec::new()
+                    },
+                    line: rebuilt[off..end].to_vec(),
+                    is_match: true,
+                    starts: u32::from(first),
+                });
+                first = false;
+                match nl {
+                    None => break,
+                    Some(p) => {
+                        off = off + p + 1;
+                        ln += 1;
+                    }
+                }
+            }
+        }
         return lines;
     }
-    expand_context(data, lines, before, after)
+
+    for m in re.find_iter(data) {
+        if o.matches_only {
+            return existence();
+        }
+        if let Some(max) = o.max_count {
+            if matches_seen >= max {
+                break;
+            }
+        }
+        matches_seen += 1;
+        for p in memchr::memchr_iter(b'\n', &data[counted_to..m.start()]) {
+            line_no += 1;
+            line_anchor = counted_to + p + 1;
+        }
+        counted_to = m.start();
+
+        let last = if m.end() > m.start() {
+            m.end() - 1
+        } else {
+            m.start().min(data.len().saturating_sub(1))
+        };
+        let mut ls = line_anchor;
+        let mut ln = line_no;
+        loop {
+            let le = memchr::memchr(b'\n', &data[ls..]).map_or(data.len(), |p| ls + p);
+            let s = m.start().max(ls);
+            let e = m.end().min(le);
+            let is_first = ln == line_no;
+            // The previous match may already have emitted this line; merge
+            // instead of duplicating. Only the tail of `lines` can qualify.
+            let mut merged = false;
+            for l in lines.iter_mut().rev() {
+                if l.line_number < ln {
+                    break;
+                }
+                if l.line_number == ln {
+                    if e > s {
+                        l.spans.push((s - ls, e - ls));
+                    }
+                    l.starts += u32::from(is_first);
+                    merged = true;
+                    break;
+                }
+            }
+            if !merged {
+                lines.push(MatchLine {
+                    line_number: ln,
+                    spans: if e > s {
+                        vec![(s - ls, e - ls)]
+                    } else {
+                        Vec::new()
+                    },
+                    line: data[ls..le].to_vec(),
+                    is_match: true,
+                    starts: u32::from(is_first),
+                });
+            }
+            if le >= data.len() || last <= le {
+                break;
+            }
+            ls = le + 1;
+            ln += 1;
+        }
+    }
+    lines
 }
 
 /// Given the matching lines, pull in `before`/`after` neighbour lines.
 /// Returns lines in order, with context lines marked `is_match = false`.
 /// Overlapping context windows merge naturally (one entry per line number).
+/// Matched lines keep their own text (which may be rebuilt by -r) rather
+/// than being re-read from `data`.
 fn expand_context(
     data: &[u8],
     matches: Vec<MatchLine>,
@@ -538,8 +824,6 @@ fn expand_context(
 ) -> Vec<MatchLine> {
     use std::collections::BTreeMap;
 
-    // line number -> spans, for the lines that actually matched.
-    let mut spans_by_line: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
     // Wanted inclusive line ranges, merged.
     let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(matches.len());
     for m in &matches {
@@ -550,8 +834,10 @@ fn expand_context(
             _ => ranges.push((lo, hi)),
         }
     }
+    // line number -> the matched entry itself.
+    let mut by_line: BTreeMap<u64, MatchLine> = BTreeMap::new();
     for m in matches {
-        spans_by_line.insert(m.line_number, m.spans);
+        by_line.insert(m.line_number, m);
     }
 
     let mut out: Vec<MatchLine> = Vec::new();
@@ -564,14 +850,16 @@ fn expand_context(
             ri += 1;
         }
         if ri < ranges.len() && ranges[ri].0 <= line_no {
-            let spans = spans_by_line.remove(&line_no);
-            let is_match = spans.is_some();
-            out.push(MatchLine {
-                line_number: line_no,
-                spans: spans.unwrap_or_default(),
-                line: data[start..line_end].to_vec(),
-                is_match,
-            });
+            match by_line.remove(&line_no) {
+                Some(m) => out.push(m),
+                None => out.push(MatchLine {
+                    line_number: line_no,
+                    spans: Vec::new(),
+                    line: data[start..line_end].to_vec(),
+                    is_match: false,
+                    starts: 0,
+                }),
+            }
         }
         if line_end == data.len() {
             break;
@@ -617,13 +905,17 @@ fn scan_targets(
                     if trigram::looks_binary(&data) {
                         continue;
                     }
-                    let lines = scan_buffer_ctx(
+                    let lines = scan_buffer_opts(
                         &matcher.regex,
                         &data,
-                        opts.matches_only,
-                        opts.max_count,
-                        opts.before,
-                        opts.after,
+                        &ScanOpts {
+                            matches_only: opts.matches_only,
+                            max_count: opts.max_count,
+                            before: opts.before,
+                            after: opts.after,
+                            multiline: opts.multiline,
+                            replace: opts.replace.as_deref(),
+                        },
                     );
                     if !lines.is_empty() {
                         local.push(FileResult {
@@ -892,6 +1184,119 @@ mod tests {
             ..Default::default()
         };
         assert!(FileFilter::build(&opts).is_err());
+    }
+
+    #[test]
+    fn replace_rebuilds_lines() {
+        let data = b"alice@example\nbob@test plus carol@dev\n";
+        let rx = re(r"(\w+)@(\w+)");
+        let o = ScanOpts {
+            replace: Some(b"[$2/$1]"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&rx, data, &o);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, b"[example/alice]");
+        assert_eq!(lines[0].spans, vec![(0, 15)]);
+        assert_eq!(lines[1].line, b"[test/bob] plus [dev/carol]");
+        assert_eq!(lines[1].spans, vec![(0, 10), (16, 27)]);
+        assert_eq!(lines[1].starts, 2);
+
+        // $$ is a literal dollar; a missing group expands to nothing.
+        let o = ScanOpts {
+            replace: Some(b"$$9"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("alice"), data, &o);
+        assert_eq!(lines[0].line, b"$9@example");
+        let o = ScanOpts {
+            replace: Some(b"<$5>"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("alice"), data, &o);
+        assert_eq!(lines[0].line, b"<>@example");
+    }
+
+    #[test]
+    fn replace_with_context_keeps_rebuilt_line() {
+        let data = b"l1\nfoo here\nl3\n";
+        let o = ScanOpts {
+            replace: Some(b"BAR"),
+            before: 1,
+            after: 1,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("foo"), data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+        assert_eq!(lines[1].line, b"BAR here");
+        assert!(!lines[0].is_match && lines[1].is_match && !lines[2].is_match);
+    }
+
+    #[test]
+    fn multiline_emits_every_touched_line() {
+        let data = b"one\nfoo\nbar\nfoo\nbaz\n";
+        let rx = re(r"foo\nba.");
+        let o = ScanOpts {
+            multiline: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&rx, data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![2, 3, 4, 5]);
+        assert!(lines.iter().all(|l| l.is_match));
+        let starts: Vec<u32> = lines.iter().map(|l| l.starts).collect();
+        assert_eq!(starts, vec![1, 0, 1, 0], "-c counts matches, not lines");
+        assert_eq!(lines[0].spans, vec![(0, 3)]);
+        assert_eq!(lines[1].spans, vec![(0, 3)]);
+
+        // -m 1 keeps only the first match (both of its lines).
+        let o = ScanOpts {
+            multiline: true,
+            max_count: Some(1),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&rx, data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![2, 3]);
+
+        // A match ending in '\n' does not touch the following line.
+        let o = ScanOpts {
+            multiline: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re(r"foo\n"), data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![2, 4]);
+    }
+
+    #[test]
+    fn multiline_adjacent_matches_share_a_line() {
+        let data = b"one two\nthree four\n";
+        let o = ScanOpts {
+            multiline: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re(r"e two\nthr|ur"), data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![1, 2], "shared line must not be duplicated");
+        assert_eq!(lines[1].spans, vec![(0, 3), (8, 10)]);
+        assert_eq!(lines[0].starts + lines[1].starts, 2);
+    }
+
+    #[test]
+    fn multiline_replace_collapses_region() {
+        let data = b"a\nfoo\nbar\nz\n";
+        let o = ScanOpts {
+            multiline: true,
+            replace: Some(b"XX"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re(r"foo\nbar"), data, &o);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_number, 2);
+        assert_eq!(lines[0].line, b"XX");
+        assert_eq!(lines[0].spans, vec![(0, 2)]);
     }
 
     #[test]

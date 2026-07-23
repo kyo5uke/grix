@@ -234,6 +234,34 @@ fn incremental_update_reflects_edits() {
 }
 
 #[test]
+fn multiline_search_equals_full_scan() {
+    let fx = fixture();
+    build_fixture_index(&fx);
+    let opts = SearchOptions {
+        multiline: true,
+        ..Default::default()
+    };
+    // Patterns spanning line boundaries: the byte-trigram index knows about
+    // "o\nb"-style trigrams, so narrowing must still be exact — including
+    // across CRLF.
+    for pattern in [
+        r"42 \}\npub fn",
+        r"alpha foo\r\nbeta",
+        r"foo\nbar",
+        r"grix\W+\}",
+    ] {
+        let matcher = search::compile(pattern, &opts).unwrap();
+        let (a, _) = search_all(&fx, pattern, &opts);
+        let (b, _) = search::search_walk(&fx.root, &matcher, &opts).unwrap();
+        assert_eq!(
+            result_set(&a),
+            result_set(&b),
+            "multiline diverged for {pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn path_scope_dir_filters() {
     let fx = fixture();
     build_fixture_index(&fx);

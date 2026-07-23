@@ -180,7 +180,7 @@ The flag set is still small.
 
 | supported | not yet |
 | --- | --- |
-| `-i`, `-F`, `-e`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `--`, `--json`, `--no-heading`, `--color` | `-U`, `--replace` |
+| `-i`, `-F`, `-e`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `-U`, `-r`/`--replace`, `--`, `--json`, `--no-heading`, `--color` | `-w`, `-v`, `-o`, `-S` |
 
 If grix and ripgrep disagree on matched lines within the supported set, please
 open an issue.

@@ -126,6 +126,8 @@ fn tool_schemas() -> Value {
                     "type": {"type": "string", "description": "optional file type, e.g. rust, py, js"},
                     "ignore_case": {"type": "boolean", "description": "case-insensitive search"},
                     "fixed": {"type": "boolean", "description": "treat the pattern as a literal string"},
+                    "multiline": {"type": "boolean", "description": "matches may span lines (like rg -U)"},
+                    "replace": {"type": "string", "description": "replace matches in the output with this text ($1/$name refs); files are never modified"},
                     "context": {"type": "integer", "description": "lines of context to show around each match"},
                     "max_results": {"type": "integer", "description": "cap on matched lines returned (default 200)"}
                 },
@@ -191,6 +193,14 @@ fn build_opts(args: &Value, root: &Path) -> SearchOptions {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         fixed_string: args.get("fixed").and_then(Value::as_bool).unwrap_or(false),
+        multiline: args
+            .get("multiline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        replace: args
+            .get("replace")
+            .and_then(Value::as_str)
+            .map(|r| r.as_bytes().to_vec()),
         ..Default::default()
     };
     let ctx = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;

@@ -29,6 +29,9 @@ OPTIONS:
     -F              treat the pattern as a literal string
     -e <PATTERN>    use PATTERN (needed for patterns starting with '-')
     --              end of options; everything after is pattern/paths
+    -U              multiline: matches may span lines (shows every line touched)
+    -r <TEXT>       replace matches with TEXT in the output ($1/$name refs;
+                    files are never modified)
     -l              list matching files only
     -c              print per-file match counts
     -m <N>          stop after N matching lines per file
@@ -59,6 +62,8 @@ struct Cli {
     command: Cmd,
     case_insensitive: bool,
     fixed: bool,
+    multiline: bool,
+    replace: Option<String>,
     files_only: bool,
     counts: bool,
     max_count: Option<u64>,
@@ -101,6 +106,8 @@ fn parse_args() -> Result<Cli, String> {
         command: Cmd::Search,
         case_insensitive: false,
         fixed: false,
+        multiline: false,
+        replace: None,
         files_only: false,
         counts: false,
         max_count: None,
@@ -137,6 +144,11 @@ fn parse_args() -> Result<Cli, String> {
             }
             "-i" => cli.case_insensitive = true,
             "-F" => cli.fixed = true,
+            "-U" | "--multiline" => cli.multiline = true,
+            "-r" | "--replace" => {
+                let v = args.next().ok_or("-r needs replacement text")?;
+                cli.replace = Some(v);
+            }
             "-e" => {
                 let v = args.next().ok_or("-e needs a pattern")?;
                 pattern_flag = Some(v);
@@ -443,6 +455,8 @@ struct Printer {
     counts: bool,
     /// Context (-A/-B/-C) is active; groups get "--" dividers like grep.
     context: bool,
+    /// -U: -c counts matches (a multiline match is one), not matched lines.
+    multiline: bool,
 }
 
 impl Printer {
@@ -458,7 +472,11 @@ impl Printer {
                 continue;
             }
             if self.counts {
-                let n = fr.lines.iter().filter(|l| l.is_match).count();
+                let n = if self.multiline {
+                    fr.lines.iter().map(|l| l.starts as usize).sum()
+                } else {
+                    fr.lines.iter().filter(|l| l.is_match).count()
+                };
                 writeln!(out, "{}:{}", fr.rel_path, n)?;
                 total += n as u64;
                 continue;
@@ -631,6 +649,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         case_insensitive: cli.case_insensitive,
         fixed_string: cli.fixed,
         matches_only: cli.files_only,
+        multiline: cli.multiline,
+        replace: cli.replace.clone().map(String::into_bytes),
         max_count: cli.max_count,
         before: if want_context { cli.before } else { 0 },
         after: if want_context { cli.after } else { 0 },
@@ -762,6 +782,7 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         files_only: cli.files_only,
         counts: cli.counts,
         context: opts.before > 0 || opts.after > 0,
+        multiline: cli.multiline,
     };
     if let Err(e) = printer.print(&results) {
         // Downstream closed the pipe (e.g. `grix foo | head`): finish
