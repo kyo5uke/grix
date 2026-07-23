@@ -17,7 +17,7 @@ files.
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![ripgrep 1.57s, grix 16.9ms on the linux kernel tree (92,823 files); identical matches](docs/bench-kernel.png)
+![ripgrep 1.34s, grix 16.5ms on the linux kernel tree (92,823 files); identical matches](docs/bench-kernel.png)
 
 ## Why
 

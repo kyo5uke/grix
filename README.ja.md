@@ -12,7 +12,7 @@ grix は trigram 索引を使う grep です。
 [![ci](https://github.com/kyo5uke/grix/actions/workflows/ci.yml/badge.svg)](https://github.com/kyo5uke/grix/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-![Linuxカーネル92,823ファイルで ripgrep 1.57秒、grix 16.9ms。マッチ行は同一](docs/bench-kernel.png)
+![Linuxカーネル92,823ファイルで ripgrep 1.34秒、grix 16.5ms。マッチ行は同一](docs/bench-kernel.png)
 
 ## なぜ作ったか
 
