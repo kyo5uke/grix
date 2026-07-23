@@ -323,9 +323,9 @@ fn build_attempt(
             Some(o) => o.tombstones().eq(tombstones.iter().copied()),
             None => tombstones.is_empty(),
         };
-        let kept_all_over = old_over.as_ref().map_or(over_kept == 0, |o| {
-            over_kept == o.file_count()
-        });
+        let kept_all_over = old_over
+            .as_ref()
+            .map_or(over_kept == 0, |o| over_kept == o.file_count());
         if new_files == 0 && kept_all_over && same_tomb {
             // Nothing changed relative to base+overlay: write nothing.
             fill_flag_stats(&mut stats, &flags);
@@ -443,8 +443,7 @@ fn build_attempt(
                         // search rather than half-index it.
                         _ => msg.binaries.push(*new_id),
                     }
-                    if msg.pairs.len() >= FLUSH_PAIRS
-                        && tx.send(std::mem::take(&mut msg)).is_err()
+                    if msg.pairs.len() >= FLUSH_PAIRS && tx.send(std::mem::take(&mut msg)).is_err()
                     {
                         return; // receiver bailed on an io error
                     }
@@ -487,7 +486,14 @@ fn build_attempt(
     }
     let (merged, _guard) = acc.into_source(old_runs)?;
     let root_str = root.to_string_lossy().replace('\\', "/");
-    format::write_index(target_path, &root_str, &records, merged, &tombs_out, out_ids)?;
+    format::write_index(
+        target_path,
+        &root_str,
+        &records,
+        merged,
+        &tombs_out,
+        out_ids,
+    )?;
     if full {
         // Any overlay now describes a dead base.
         let _ = std::fs::remove_file(&overlay_path);

@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::index::format::{FileMeta, IndexError, IndexReader, Postings, FLAG_BINARY, FLAG_SCAN_ALWAYS};
+use crate::index::format::{
+    FileMeta, IndexError, IndexReader, Postings, FLAG_BINARY, FLAG_SCAN_ALWAYS,
+};
 use crate::plan::{self, Query};
 use crate::trigram;
 
@@ -37,8 +39,7 @@ enum IdSet {
 impl<'a> View<'a> {
     pub fn new(base: &'a IndexReader, overlay: Option<&'a IndexReader>) -> Self {
         // Callers validate the pairing; be defensive anyway.
-        let overlay =
-            overlay.filter(|o| o.index_ids().parent_id == base.index_ids().build_id);
+        let overlay = overlay.filter(|o| o.index_ids().parent_id == base.index_ids().build_id);
         let mut dead = vec![0u64; base.file_count().div_ceil(64)];
         let mut dead_count = 0usize;
         if let Some(o) = overlay {

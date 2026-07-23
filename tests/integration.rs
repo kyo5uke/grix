@@ -179,7 +179,10 @@ fn incremental_update_reflects_edits() {
     let fx = fixture();
     build_fixture_index(&fx);
     let opts = SearchOptions::default();
-    let base_mtime = std::fs::metadata(&fx.index_path).unwrap().modified().unwrap();
+    let base_mtime = std::fs::metadata(&fx.index_path)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     // New file + modified file + deleted file.
     write(
@@ -204,7 +207,10 @@ fn incremental_update_reflects_edits() {
     // The refresh went to the overlay; the base was not rewritten.
     assert!(overlay_path(&fx.index_path).exists());
     assert_eq!(
-        std::fs::metadata(&fx.index_path).unwrap().modified().unwrap(),
+        std::fs::metadata(&fx.index_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
         base_mtime,
         "small refresh must not rewrite the base index"
     );

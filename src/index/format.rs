@@ -335,7 +335,9 @@ fn write_index_streamed(
                 tri_table.extend_from_slice(&df.to_le_bytes());
                 continue;
             }
-            let PostList::Ids(ids) = list else { unreachable!() };
+            let PostList::Ids(ids) = list else {
+                unreachable!()
+            };
             buf.clear();
             if ids.len() > bitmap_at {
                 // Mid-frequency list: a fixed-width bitmap beats varint and

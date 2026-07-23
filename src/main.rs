@@ -220,9 +220,7 @@ fn parse_args() -> Result<Cli, String> {
     if pattern_flag.is_some() || no_subcommand {
         cli.pattern = match pattern_flag {
             Some(p) => Some(p),
-            None if positionals.is_empty() => {
-                return Err("missing pattern (try --help)".into())
-            }
+            None if positionals.is_empty() => return Err("missing pattern (try --help)".into()),
             None => Some(positionals.remove(0)),
         };
         cli.paths = positionals.iter().map(PathBuf::from).collect();
@@ -377,9 +375,7 @@ fn cmd_status(path: Option<&Path>) -> Result<(), String> {
     let start = path.unwrap_or(Path::new("."));
     match store::find_index_upward(start) {
         Some((idx, root)) => {
-            if let Err(grix::index::format::IndexError::WrongVersion(v)) =
-                IndexReader::open(&idx)
-            {
+            if let Err(grix::index::format::IndexError::WrongVersion(v)) = IndexReader::open(&idx) {
                 println!("root:     {}", root.display());
                 println!("index:    {} (old format v{v})", idx.display());
                 println!(
