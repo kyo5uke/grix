@@ -32,6 +32,10 @@ OPTIONS:
     -U              multiline: matches may span lines (shows every line touched)
     -r <TEXT>       replace matches with TEXT in the output ($1/$name refs;
                     files are never modified)
+    -w              only match surrounded by word boundaries
+    -v              invert: print non-matching lines (cannot use the index)
+    -o              print each match on its own line instead of the whole line
+    -S              smart case: insensitive unless the pattern has uppercase
     -l              list matching files only
     -c              print per-file match counts
     -m <N>          stop after N matching lines per file
@@ -64,6 +68,10 @@ struct Cli {
     fixed: bool,
     multiline: bool,
     replace: Option<String>,
+    word: bool,
+    invert: bool,
+    only_matching: bool,
+    smart_case: bool,
     files_only: bool,
     counts: bool,
     max_count: Option<u64>,
@@ -108,6 +116,10 @@ fn parse_args() -> Result<Cli, String> {
         fixed: false,
         multiline: false,
         replace: None,
+        word: false,
+        invert: false,
+        only_matching: false,
+        smart_case: false,
         files_only: false,
         counts: false,
         max_count: None,
@@ -149,6 +161,10 @@ fn parse_args() -> Result<Cli, String> {
                 let v = args.next().ok_or("-r needs replacement text")?;
                 cli.replace = Some(v);
             }
+            "-w" | "--word-regexp" => cli.word = true,
+            "-v" | "--invert-match" => cli.invert = true,
+            "-o" | "--only-matching" => cli.only_matching = true,
+            "-S" | "--smart-case" => cli.smart_case = true,
             "-e" => {
                 let v = args.next().ok_or("-e needs a pattern")?;
                 pattern_flag = Some(v);
@@ -455,8 +471,8 @@ struct Printer {
     counts: bool,
     /// Context (-A/-B/-C) is active; groups get "--" dividers like grep.
     context: bool,
-    /// -U: -c counts matches (a multiline match is one), not matched lines.
-    multiline: bool,
+    /// -U/-o: -c counts matches, not matched lines.
+    count_matches: bool,
 }
 
 impl Printer {
@@ -472,7 +488,7 @@ impl Printer {
                 continue;
             }
             if self.counts {
-                let n = if self.multiline {
+                let n = if self.count_matches {
                     fr.lines.iter().map(|l| l.starts as usize).sum()
                 } else {
                     fr.lines.iter().filter(|l| l.is_match).count()
@@ -642,15 +658,19 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     // the search *within* it rather than choosing a different index.
     let anchor = PathBuf::from(".");
 
-    // Context is a feature of normal line output; -l (files) and -c (counts)
-    // ignore it, matching grep/ripgrep.
-    let want_context = !cli.files_only && !cli.counts && !cli.json;
+    // Context is a feature of normal line output; -l (files), -c (counts)
+    // and -o (match-only rows) ignore it, matching grep/ripgrep.
+    let want_context = !cli.files_only && !cli.counts && !cli.json && !cli.only_matching;
     let opts = SearchOptions {
         case_insensitive: cli.case_insensitive,
         fixed_string: cli.fixed,
         matches_only: cli.files_only,
         multiline: cli.multiline,
         replace: cli.replace.clone().map(String::into_bytes),
+        word: cli.word,
+        invert: cli.invert,
+        only_matching: cli.only_matching,
+        smart_case: cli.smart_case,
         max_count: cli.max_count,
         before: if want_context { cli.before } else { 0 },
         after: if want_context { cli.after } else { 0 },
@@ -782,7 +802,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         files_only: cli.files_only,
         counts: cli.counts,
         context: opts.before > 0 || opts.after > 0,
-        multiline: cli.multiline,
+        // -v is line output again, so it counts lines even under -U/-o.
+        count_matches: (cli.multiline || cli.only_matching) && !cli.invert,
     };
     if let Err(e) = printer.print(&results) {
         // Downstream closed the pipe (e.g. `grix foo | head`): finish

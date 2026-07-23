@@ -176,11 +176,15 @@ The main supported forms are:
 * `--json`
 * `--color`
 
-The flag set is still small.
+The everyday ripgrep flags are all covered:
 
-| supported | not yet |
-| --- | --- |
-| `-i`, `-F`, `-e`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `-U`, `-r`/`--replace`, `--`, `--json`, `--no-heading`, `--color` | `-w`, `-v`, `-o`, `-S` |
+`-i`, `-S`, `-F`, `-e`, `-w`, `-v`, `-o`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`,
+`-g`, `-t`, `-T`, `-U`, `-r`/`--replace`, `--`, `--json`, `--no-heading`,
+`--color`
+
+Each one is verified against ripgrep's actual output on the Linux kernel
+tree (including the corner cases: `-w` uses rg's surrounded-by semantics,
+`-c` counts matches under `-U`/`-o`, and so on).
 
 If grix and ripgrep disagree on matched lines within the supported set, please
 open an issue.

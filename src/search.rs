@@ -155,6 +155,19 @@ pub struct SearchOptions {
     /// Display-time replacement for matched text (-r), with `$group` refs.
     /// Files are never modified.
     pub replace: Option<Vec<u8>>,
+    /// Only count matches with non-word (or edge) neighbours (-w). Like
+    /// ripgrep this is a *surrounded-by* test, not `\b` rewriting: `-w '::'`
+    /// matches in `x :: y` but not in `a::b`.
+    pub word: bool,
+    /// Print lines that do NOT match (-v). The index cannot narrow this —
+    /// a file with zero candidate trigrams matches everywhere — so every
+    /// file is scanned.
+    pub invert: bool,
+    /// Print each match on its own line instead of the whole line (-o).
+    pub only_matching: bool,
+    /// Case-insensitive iff the pattern has no uppercase literal (-S).
+    /// An explicit `case_insensitive` wins.
+    pub smart_case: bool,
     /// Glob filters (-g). A leading `!` excludes; otherwise, the presence of
     /// any positive glob restricts results to files that match one.
     pub globs: Vec<String>,
@@ -250,6 +263,10 @@ impl Default for SearchOptions {
             after: 0,
             multiline: false,
             replace: None,
+            word: false,
+            invert: false,
+            only_matching: false,
+            smart_case: false,
             globs: Vec::new(),
             types_select: Vec::new(),
             types_negate: Vec::new(),
@@ -319,8 +336,54 @@ pub struct Matcher {
     pub query: Query,
 }
 
+/// True when the pattern contains an uppercase *literal* (the -S test).
+/// Class names like `\S` or `\W` do not count, matching ripgrep.
+pub fn pattern_has_uppercase(pattern: &str, fixed: bool) -> bool {
+    if fixed {
+        return pattern.chars().any(char::is_uppercase);
+    }
+    use regex_syntax::ast::{self, Ast};
+    struct Upper {
+        found: bool,
+    }
+    impl ast::Visitor for Upper {
+        type Output = bool;
+        type Err = ();
+        fn finish(self) -> Result<bool, ()> {
+            Ok(self.found)
+        }
+        fn visit_pre(&mut self, a: &Ast) -> Result<(), ()> {
+            if let Ast::Literal(l) = a {
+                if l.c.is_uppercase() {
+                    self.found = true;
+                }
+            }
+            Ok(())
+        }
+        fn visit_class_set_item_pre(&mut self, item: &ast::ClassSetItem) -> Result<(), ()> {
+            match item {
+                ast::ClassSetItem::Literal(l) if l.c.is_uppercase() => self.found = true,
+                ast::ClassSetItem::Range(r)
+                    if r.start.c.is_uppercase() || r.end.c.is_uppercase() =>
+                {
+                    self.found = true
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+    match ast::parse::Parser::new().parse(pattern) {
+        Ok(a) => ast::visit(&a, Upper { found: false }).unwrap_or(true),
+        // Invalid pattern: stay case-sensitive; compile reports the error.
+        Err(_) => true,
+    }
+}
+
 /// Compile the pattern into both the index query and the confirming regex.
 pub fn compile(pattern: &str, opts: &SearchOptions) -> Result<Matcher, SearchError> {
+    let case_insensitive = opts.case_insensitive
+        || (opts.smart_case && !pattern_has_uppercase(pattern, opts.fixed_string));
     let pattern_owned;
     let pattern = if opts.fixed_string {
         pattern_owned = regex_syntax::escape(pattern);
@@ -331,10 +394,10 @@ pub fn compile(pattern: &str, opts: &SearchOptions) -> Result<Matcher, SearchErr
     if pattern.is_empty() {
         return Err(SearchError::BadPattern("empty pattern".into()));
     }
-    let query = plan::plan(pattern, opts.case_insensitive)
+    let query = plan::plan(pattern, case_insensitive)
         .map_err(|e| SearchError::BadPattern(e.to_string()))?;
     let regex = regex::bytes::RegexBuilder::new(pattern)
-        .case_insensitive(opts.case_insensitive)
+        .case_insensitive(case_insensitive)
         .multi_line(true)
         .build()
         .map_err(|e| SearchError::BadPattern(e.to_string()))?;
@@ -452,7 +515,7 @@ fn load(path: &Path, size_hint: u64) -> std::io::Result<FileData> {
     }
 }
 
-/// Per-scan options: the three scanner modes share one signature.
+/// Per-scan options: the scanner modes share one signature.
 #[derive(Default)]
 pub struct ScanOpts<'a> {
     pub matches_only: bool,
@@ -461,6 +524,102 @@ pub struct ScanOpts<'a> {
     pub after: usize,
     pub multiline: bool,
     pub replace: Option<&'a [u8]>,
+    pub word: bool,
+    pub invert: bool,
+    pub only: bool,
+}
+
+#[inline]
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Decode the character ending at byte `i` (raw byte when not UTF-8).
+fn char_before(data: &[u8], i: usize) -> Option<char> {
+    for k in 1..=4usize.min(i) {
+        if let Ok(s) = std::str::from_utf8(&data[i - k..i]) {
+            return s.chars().next();
+        }
+    }
+    if i > 0 {
+        Some(data[i - 1] as char)
+    } else {
+        None
+    }
+}
+
+/// Decode the character starting at byte `i` (raw byte when not UTF-8).
+fn char_after(data: &[u8], i: usize) -> Option<char> {
+    if i >= data.len() {
+        return None;
+    }
+    for k in 1..=4usize.min(data.len() - i) {
+        if let Ok(s) = std::str::from_utf8(&data[i..i + k]) {
+            return s.chars().next();
+        }
+    }
+    Some(data[i] as char)
+}
+
+/// rg's -w test: the match is surrounded by non-word characters or edges.
+fn word_bounded(data: &[u8], s: usize, e: usize) -> bool {
+    !char_before(data, s).is_some_and(is_word_char)
+        && !char_after(data, e).is_some_and(is_word_char)
+}
+
+/// Match enumeration shared by every scan mode. With `word`, a match whose
+/// neighbour is a word character is rejected and the search resumes one
+/// byte after the *start* of the rejected match — not after its end — so an
+/// overlapping bounded match further in is still found (e.g. `a:a` in
+/// `za:a:a` matches at the second position like it does for ripgrep).
+struct MatchIter<'r, 'd> {
+    re: &'r regex::bytes::Regex,
+    data: &'d [u8],
+    pos: usize,
+    word: bool,
+}
+
+impl<'r, 'd> MatchIter<'r, 'd> {
+    fn new(re: &'r regex::bytes::Regex, data: &'d [u8], word: bool) -> Self {
+        MatchIter {
+            re,
+            data,
+            pos: 0,
+            word,
+        }
+    }
+
+    fn next_span(&mut self) -> Option<(usize, usize)> {
+        while self.pos <= self.data.len() {
+            let m = self.re.find_at(self.data, self.pos)?;
+            if self.word && !word_bounded(self.data, m.start(), m.end()) {
+                self.pos = m.start() + 1;
+                continue;
+            }
+            self.pos = if m.end() > m.start() {
+                m.end()
+            } else {
+                m.end() + 1
+            };
+            return Some((m.start(), m.end()));
+        }
+        None
+    }
+
+    fn next_caps(&mut self) -> Option<regex::bytes::Captures<'d>> {
+        while self.pos <= self.data.len() {
+            let caps = self.re.captures_at(self.data, self.pos)?;
+            let m = caps.get(0).unwrap();
+            let (ms, me) = (m.start(), m.end());
+            if self.word && !word_bounded(self.data, ms, me) {
+                self.pos = ms + 1;
+                continue;
+            }
+            self.pos = if me > ms { me } else { me + 1 };
+            return Some(caps);
+        }
+        None
+    }
 }
 
 /// Scan one buffer, collecting matched lines.
@@ -503,20 +662,120 @@ pub fn scan_buffer_ctx(
     )
 }
 
-/// Full scanner entry point: dispatches to the line-by-line, replacing or
-/// multiline scan, then expands -A/-B/-C context.
+/// Full scanner entry point: dispatches to the inverted, line-by-line,
+/// replacing or multiline scan, applies -o, then expands -A/-B/-C context.
 pub fn scan_buffer_opts(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
-    let lines = if o.multiline {
+    let lines = if o.invert {
+        scan_invert(re, data, o)
+    } else if o.multiline {
         scan_multiline(re, data, o)
     } else if o.replace.is_some() {
         scan_single_replace(re, data, o)
     } else {
         scan_single(re, data, o)
     };
-    if (o.before == 0 && o.after == 0) || lines.is_empty() {
+    let lines = if o.only && !o.invert {
+        explode_only_matching(lines)
+    } else {
+        lines
+    };
+    if o.only || (o.before == 0 && o.after == 0) || lines.is_empty() {
         return lines;
     }
     expand_context(data, lines, o.before, o.after)
+}
+
+/// -o: each span becomes its own output row (one line per match, like rg).
+/// `starts` rides on the first row of each source line so -c still counts
+/// matches correctly.
+fn explode_only_matching(lines: Vec<MatchLine>) -> Vec<MatchLine> {
+    let mut out = Vec::new();
+    for l in lines {
+        let mut starts = l.starts;
+        for &(s, e) in &l.spans {
+            out.push(MatchLine {
+                line_number: l.line_number,
+                spans: vec![(0, e - s)],
+                line: l.line[s..e].to_vec(),
+                is_match: true,
+                starts,
+            });
+            starts = 0;
+        }
+    }
+    out
+}
+
+/// -v: emit the lines that do NOT match. With -U, the lines not touched by
+/// any (word-checked) match; otherwise a per-line test. The index cannot
+/// narrow inverted searches, so callers hand us every file.
+fn scan_invert(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<MatchLine> {
+    // For -U, precollect matched line ranges over the whole buffer.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    if o.multiline {
+        let mut line_no = 1u64;
+        let mut counted_to = 0usize;
+        let mut it = MatchIter::new(re, data, o.word);
+        while let Some((ms, me)) = it.next_span() {
+            for _ in memchr::memchr_iter(b'\n', &data[counted_to..ms]) {
+                line_no += 1;
+            }
+            counted_to = ms;
+            let last = if me > ms { me - 1 } else { ms };
+            let nl = memchr::memchr_iter(b'\n', &data[ms..last.min(data.len())]).count() as u64;
+            let (lo, hi) = (line_no, line_no + nl);
+            match ranges.last_mut() {
+                // Merge only true overlaps: a clean line *between* two
+                // matches is unmatched and must stay eligible.
+                Some(r) if lo <= r.1 => r.1 = r.1.max(hi),
+                _ => ranges.push((lo, hi)),
+            }
+        }
+    }
+
+    let mut out: Vec<MatchLine> = Vec::new();
+    let mut start = 0usize;
+    let mut line_no = 1u64;
+    let mut ri = 0usize;
+    while start < data.len() {
+        let le = memchr::memchr(b'\n', &data[start..]).map_or(data.len(), |p| start + p);
+        let matched = if o.multiline {
+            while ri < ranges.len() && ranges[ri].1 < line_no {
+                ri += 1;
+            }
+            ri < ranges.len() && ranges[ri].0 <= line_no
+        } else {
+            let slice = &data[start..le];
+            if o.word {
+                MatchIter::new(re, slice, true).next_span().is_some()
+            } else {
+                re.is_match(slice)
+            }
+        };
+        if !matched {
+            if o.matches_only {
+                return existence();
+            }
+            if let Some(max) = o.max_count {
+                if out.len() as u64 >= max {
+                    break;
+                }
+            }
+            out.push(MatchLine {
+                line_number: line_no,
+                spans: Vec::new(),
+                line: data[start..le].to_vec(),
+                is_match: true,
+                starts: 1,
+            });
+        }
+        if le == data.len() {
+            break;
+        }
+        start = le + 1;
+        line_no += 1;
+    }
+    out
 }
 
 /// The one MatchLine that says "this file matches" (-l / recon calls).
@@ -537,17 +796,18 @@ fn scan_single(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Match
     let mut line_anchor: usize = 0; // start offset of the line containing counted_to
     let mut cur_line: Option<(usize, usize)> = None; // (start, end) of last line emitted
 
-    for m in re.find_iter(data) {
+    let mut it = MatchIter::new(re, data, o.word);
+    while let Some((mstart, mend)) = it.next_span() {
         // grep/ripgrep search line by line: a match can never span a
         // newline. Enforce the same semantics for output parity (e.g. \s+
         // would otherwise bridge lines).
-        if memchr::memchr(b'\n', &data[m.start()..m.end()]).is_some() {
+        if memchr::memchr(b'\n', &data[mstart..mend]).is_some() {
             continue;
         }
         if o.matches_only {
             return existence();
         }
-        let start = m.start();
+        let start = mstart;
         // Count newlines up to the match, tracking the last one so the line
         // start needs no backwards scan (keeps pathological empty-match
         // patterns linear instead of quadratic).
@@ -563,8 +823,8 @@ fn scan_single(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Match
         if cur_line == Some((line_start, line_end)) {
             // Another match on the same line: extend spans.
             let last = lines.last_mut().unwrap();
-            let s = m.start().max(line_start) - line_start;
-            let e = m.end().min(line_end) - line_start;
+            let s = mstart.max(line_start) - line_start;
+            let e = mend.min(line_end) - line_start;
             if e > s {
                 last.spans.push((s, e));
             }
@@ -575,8 +835,8 @@ fn scan_single(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Match
                     break;
                 }
             }
-            let s = m.start() - line_start;
-            let e = m.end().min(line_end) - line_start;
+            let s = mstart - line_start;
+            let e = mend.min(line_end) - line_start;
             lines.push(MatchLine {
                 line_number: line_no,
                 spans: if e > s { vec![(s, e)] } else { Vec::new() },
@@ -606,7 +866,8 @@ fn scan_single_replace(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> V
     let mut starts: u32 = 0;
     let mut src = 0usize; // absolute position in `data` copied so far
 
-    for caps in re.captures_iter(data) {
+    let mut it = MatchIter::new(re, data, o.word);
+    while let Some(caps) = it.next_caps() {
         let m = caps.get(0).unwrap();
         if memchr::memchr(b'\n', &data[m.start()..m.end()]).is_some() {
             continue;
@@ -677,7 +938,8 @@ fn scan_multiline(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Ma
     let mut matches_seen: u64 = 0;
 
     if let Some(rep) = o.replace {
-        for caps in re.captures_iter(data) {
+        let mut it = MatchIter::new(re, data, o.word);
+        while let Some(caps) = it.next_caps() {
             let m = caps.get(0).unwrap();
             if o.matches_only {
                 return existence();
@@ -744,7 +1006,8 @@ fn scan_multiline(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Ma
         return lines;
     }
 
-    for m in re.find_iter(data) {
+    let mut it = MatchIter::new(re, data, o.word);
+    while let Some((mstart, mend)) = it.next_span() {
         if o.matches_only {
             return existence();
         }
@@ -754,23 +1017,23 @@ fn scan_multiline(re: &regex::bytes::Regex, data: &[u8], o: &ScanOpts) -> Vec<Ma
             }
         }
         matches_seen += 1;
-        for p in memchr::memchr_iter(b'\n', &data[counted_to..m.start()]) {
+        for p in memchr::memchr_iter(b'\n', &data[counted_to..mstart]) {
             line_no += 1;
             line_anchor = counted_to + p + 1;
         }
-        counted_to = m.start();
+        counted_to = mstart;
 
-        let last = if m.end() > m.start() {
-            m.end() - 1
+        let last = if mend > mstart {
+            mend - 1
         } else {
-            m.start().min(data.len().saturating_sub(1))
+            mstart.min(data.len().saturating_sub(1))
         };
         let mut ls = line_anchor;
         let mut ln = line_no;
         loop {
             let le = memchr::memchr(b'\n', &data[ls..]).map_or(data.len(), |p| ls + p);
-            let s = m.start().max(ls);
-            let e = m.end().min(le);
+            let s = mstart.max(ls);
+            let e = mend.min(le);
             let is_first = ln == line_no;
             // The previous match may already have emitted this line; merge
             // instead of duplicating. Only the tail of `lines` can qualify.
@@ -915,6 +1178,9 @@ fn scan_targets(
                             after: opts.after,
                             multiline: opts.multiline,
                             replace: opts.replace.as_deref(),
+                            word: opts.word,
+                            invert: opts.invert,
+                            only: opts.only_matching,
                         },
                     );
                     if !lines.is_empty() {
@@ -942,7 +1208,14 @@ pub fn search_index(
     opts: &SearchOptions,
 ) -> Result<(Vec<FileResult>, SearchStats), SearchError> {
     let mut stats = SearchStats {
-        query_display: matcher.query.display(),
+        query_display: if opts.invert {
+            format!(
+                "{} (inverted: every file must be scanned)",
+                matcher.query.display()
+            )
+        } else {
+            matcher.query.display()
+        },
         files_in_index: view.file_count(),
         ..Default::default()
     };
@@ -950,9 +1223,15 @@ pub fn search_index(
     let filter = FileFilter::build(opts)?;
 
     let t0 = Instant::now();
-    let ids = match eval(&matcher.query, view)? {
-        IdSet::Ids(ids) => ids,
-        IdSet::All => view.all_ids(),
+    // -v needs every file: zero trigram hits just means every line is a
+    // non-match, i.e. output.
+    let ids = if opts.invert {
+        view.all_ids()
+    } else {
+        match eval(&matcher.query, view)? {
+            IdSet::Ids(ids) => ids,
+            IdSet::All => view.all_ids(),
+        }
     };
     stats.lookup_micros = t0.elapsed().as_micros();
 
@@ -1297,6 +1576,150 @@ mod tests {
         assert_eq!(lines[0].line_number, 2);
         assert_eq!(lines[0].line, b"XX");
         assert_eq!(lines[0].spans, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn word_is_surrounded_not_bounded() {
+        // rg semantics: `-w '::'` matches in " x :: y" (non-word neighbours)
+        // but NOT in "a::b" (word neighbour) — the opposite of \b-wrapping.
+        let data = b"a::b\n x :: y\n";
+        let o = ScanOpts {
+            word: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("::"), data, &o);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_number, 2);
+
+        // Identifier case: "foo" not inside "foofoo".
+        let lines = scan_buffer_opts(&re("foo"), b"foo foofoo\n", &o);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans, vec![(0, 3)]);
+
+        // Rejected match must not swallow an overlapping bounded one:
+        // 'a:a' in "za:a:a" is rejected at 1 but accepted at 3.
+        let lines = scan_buffer_opts(&re("a:a"), b"za:a:a\n", &o);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans, vec![(3, 6)]);
+    }
+
+    #[test]
+    fn word_composes_with_replace() {
+        let o = ScanOpts {
+            word: true,
+            replace: Some(b"X"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("foo"), b"foo foofoo\n", &o);
+        assert_eq!(lines[0].line, b"X foofoo");
+    }
+
+    #[test]
+    fn invert_emits_non_matching_lines() {
+        let data = b"foo\nbar\nfoo baz\nqux\n";
+        let o = ScanOpts {
+            invert: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("foo"), data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![2, 4]);
+        assert!(lines.iter().all(|l| l.is_match && l.starts == 1));
+
+        // -m limits emitted lines; -l short-circuits.
+        let o = ScanOpts {
+            invert: true,
+            max_count: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(scan_buffer_opts(&re("foo"), data, &o).len(), 1);
+        let o = ScanOpts {
+            invert: true,
+            matches_only: true,
+            ..Default::default()
+        };
+        assert_eq!(scan_buffer_opts(&re("foo"), data, &o).len(), 1);
+        // Every line matches -> nothing to invert.
+        let o = ScanOpts {
+            invert: true,
+            ..Default::default()
+        };
+        assert!(scan_buffer_opts(&re("."), data, &o).is_empty());
+    }
+
+    #[test]
+    fn invert_multiline_excludes_touched_lines() {
+        let data = b"one\nfoo\nbar\nmid\nfoo\nbaz\n";
+        let o = ScanOpts {
+            invert: true,
+            multiline: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re(r"foo\nba."), data, &o);
+        let nums: Vec<u64> = lines.iter().map(|l| l.line_number).collect();
+        assert_eq!(nums, vec![1, 4]);
+    }
+
+    #[test]
+    fn only_matching_rows() {
+        let data = b"foo bar foo\nnope\nfoo\n";
+        let o = ScanOpts {
+            only: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("foo"), data, &o);
+        let rows: Vec<(u64, &[u8])> = lines
+            .iter()
+            .map(|l| (l.line_number, l.line.as_slice()))
+            .collect();
+        assert_eq!(rows, vec![(1, b"foo".as_slice()), (1, b"foo"), (3, b"foo")]);
+        // -c under -o counts matches: starts sum to 3.
+        assert_eq!(lines.iter().map(|l| l.starts).sum::<u32>(), 3);
+
+        // -o with -r prints the expansion.
+        let o = ScanOpts {
+            only: true,
+            replace: Some(b"<$1>"),
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re("f(o)o"), data, &o);
+        assert!(lines.iter().all(|l| l.line == b"<o>"));
+
+        // -o with -U prints per-line fragments (rg: "1:AA", "2:BB").
+        let o = ScanOpts {
+            only: true,
+            multiline: true,
+            ..Default::default()
+        };
+        let lines = scan_buffer_opts(&re(r"AA\nBB"), b"AA\nBB\nCC\n", &o);
+        let rows: Vec<(u64, &[u8])> = lines
+            .iter()
+            .map(|l| (l.line_number, l.line.as_slice()))
+            .collect();
+        assert_eq!(rows, vec![(1, b"AA".as_slice()), (2, b"BB")]);
+        assert_eq!(lines.iter().map(|l| l.starts).sum::<u32>(), 1);
+    }
+
+    #[test]
+    fn smart_case_checks_literals_only() {
+        // Class names like \S are not uppercase literals.
+        assert!(!pattern_has_uppercase(r"\Sfoo", false));
+        assert!(pattern_has_uppercase("Sfoo", false));
+        assert!(pattern_has_uppercase("[A-Z]x", false));
+        assert!(!pattern_has_uppercase(r"foo\w+", false));
+        assert!(pattern_has_uppercase("Foo", true));
+        assert!(!pattern_has_uppercase("foo", true));
+
+        // End to end: -S lowers the case only for lowercase patterns.
+        let data = b"xfoo\nXFOO\n";
+        let opts = SearchOptions {
+            smart_case: true,
+            ..Default::default()
+        };
+        let m = compile(r"\Sfoo", &opts).unwrap();
+        assert_eq!(scan_buffer(&m.regex, data, false, None).len(), 2);
+        let m = compile("Sfoo", &opts).unwrap();
+        assert_eq!(scan_buffer(&m.regex, data, false, None).len(), 0);
     }
 
     #[test]

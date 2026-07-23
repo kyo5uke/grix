@@ -262,6 +262,54 @@ fn multiline_search_equals_full_scan() {
 }
 
 #[test]
+fn flag_modes_equal_full_scan() {
+    let fx = fixture();
+    build_fixture_index(&fx);
+    // Each flag combination must agree between indexed search and a full
+    // walk — especially -v, where the index cannot narrow anything.
+    let variants: &[SearchOptions] = &[
+        SearchOptions {
+            word: true,
+            ..Default::default()
+        },
+        SearchOptions {
+            invert: true,
+            ..Default::default()
+        },
+        SearchOptions {
+            only_matching: true,
+            ..Default::default()
+        },
+        SearchOptions {
+            word: true,
+            invert: true,
+            ..Default::default()
+        },
+        SearchOptions {
+            invert: true,
+            multiline: true,
+            ..Default::default()
+        },
+        SearchOptions {
+            smart_case: true,
+            ..Default::default()
+        },
+    ];
+    for (i, opts) in variants.iter().enumerate() {
+        for pattern in ["foo", "FOO"] {
+            let matcher = search::compile(pattern, opts).unwrap();
+            let (a, _) = search_all(&fx, pattern, opts);
+            let (b, _) = search::search_walk(&fx.root, &matcher, opts).unwrap();
+            assert_eq!(
+                result_set(&a),
+                result_set(&b),
+                "variant {i} diverged for {pattern:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn path_scope_dir_filters() {
     let fx = fixture();
     build_fixture_index(&fx);
