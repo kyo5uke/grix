@@ -295,13 +295,18 @@ impl std::ops::Deref for FileData {
 }
 
 fn load(path: &Path, size_hint: u64) -> std::io::Result<FileData> {
+    let mut f = crate::index::format::open_sequential(path)?;
     if size_hint > 8 << 20 {
-        let f = std::fs::File::open(path)?;
         // Safety: bytes are only read; see note in index/format.rs.
         let m = unsafe { memmap2::Mmap::map(&f)? };
         Ok(FileData::Mapped(m))
     } else {
-        Ok(FileData::Owned(std::fs::read(path)?))
+        // The index already knows the size: pre-size the buffer and skip
+        // the extra stat that std::fs::read would do.
+        use std::io::Read;
+        let mut v = Vec::with_capacity(size_hint as usize + 16);
+        f.read_to_end(&mut v)?;
+        Ok(FileData::Owned(v))
     }
 }
 
@@ -459,7 +464,12 @@ fn scan_targets(
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<FileResult>> = Mutex::new(Vec::new());
     let scanned = AtomicUsize::new(0);
-    let nthreads = opts.threads.max(1).min(targets.len().max(1));
+    // File opens dominate the scan on Windows and block their thread, so run
+    // more threads than cores to overlap that syscall latency; the shared
+    // queue keeps CPU-bound regex work balanced anyway. (Measured on the
+    // kernel tree: 2x/4x/8x are within noise of each other, 4x picked as
+    // the portable middle.)
+    let nthreads = (opts.threads * 4).clamp(1, 64).min(targets.len().max(1));
     std::thread::scope(|s| {
         for _ in 0..nthreads {
             s.spawn(|| {
@@ -521,34 +531,30 @@ pub fn search_index(
     stats.lookup_micros = t0.elapsed().as_micros();
 
     // Candidates = query hits + always-scan files − binary, path/glob/type-filtered.
+    // Only candidate metadata is touched — the scan-always list is its own
+    // index section, so nothing here walks the whole file table.
     let mut targets: Vec<(u32, String, u64)> = Vec::with_capacity(ids.len());
-    let mut push_target = |id: u32| -> Result<(), SearchError> {
-        let meta = reader.file(id).map_err(SearchError::Index)?;
-        if meta.flags & FLAG_BINARY != 0 {
-            return Ok(());
+    {
+        let mut push_target = |id: u32, skip_scan_always: bool| -> Result<(), SearchError> {
+            let meta = reader.file(id).map_err(SearchError::Index)?;
+            if meta.flags & FLAG_BINARY != 0 {
+                return Ok(());
+            }
+            if skip_scan_always && meta.flags & FLAG_SCAN_ALWAYS != 0 {
+                return Ok(()); // added from the scan-always section instead
+            }
+            if !in_scope(meta.rel_path, &opts.path_scopes) || !filter.accept(meta.rel_path) {
+                return Ok(());
+            }
+            targets.push((id, meta.rel_path.to_string(), meta.size));
+            Ok(())
+        };
+        for &id in ids.iter() {
+            push_target(id, true)?;
         }
-        if !in_scope(meta.rel_path, &opts.path_scopes) || !filter.accept(meta.rel_path) {
-            return Ok(());
+        for id in reader.scan_always_ids() {
+            push_target(id, false)?;
         }
-        targets.push((id, meta.rel_path.to_string(), meta.size));
-        Ok(())
-    };
-    let mut seen_scan_always = Vec::new();
-    for id in 0..reader.file_count() as u32 {
-        let meta = reader.file(id).map_err(SearchError::Index)?;
-        if meta.flags & FLAG_SCAN_ALWAYS != 0 {
-            seen_scan_always.push(id);
-        }
-    }
-    for &id in ids.iter() {
-        let meta = reader.file(id).map_err(SearchError::Index)?;
-        if meta.flags & FLAG_SCAN_ALWAYS != 0 {
-            continue; // added below regardless of query
-        }
-        push_target(id)?;
-    }
-    for id in seen_scan_always {
-        push_target(id)?;
     }
     stats.candidates = targets.len();
 
@@ -578,24 +584,11 @@ pub fn search_walk(
 
     let filter = FileFilter::build(opts)?;
     let mut targets: Vec<(u32, String, u64)> = Vec::new();
-    let walker = ignore::WalkBuilder::new(root).build();
-    for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
+    for cand in crate::index::build::collect_candidates(root, opts.threads)? {
+        if !in_scope(&cand.rel_path, &opts.path_scopes) || !filter.accept(&cand.rel_path) {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        let rel_path = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        if !in_scope(&rel_path, &opts.path_scopes) || !filter.accept(&rel_path) {
-            continue;
-        }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        targets.push((0, rel_path, size));
+        targets.push((0, cand.rel_path, cand.size));
     }
     stats.candidates = targets.len();
 

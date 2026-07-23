@@ -1,15 +1,22 @@
-//! On-disk index format (version 1).
+//! On-disk index format (version 2).
 //!
 //! Single file, little-endian, designed to be mmap'd and used directly:
 //!
 //! ```text
-//! [magic "GRIXIDX1"][header][root path][paths blob][file table][trigram table][postings]
+//! [magic "GRIXIDX2"][header][root path][paths blob][file table]
+//! [scan-always ids][trigram table][postings]
 //! ```
 //!
 //! - file table: fixed 28-byte entries (path off/len, size, mtime, flags)
+//! - scan-always ids: ascending u32 file ids with FLAG_SCAN_ALWAYS, so a
+//!   search adds them without walking the whole file table (v1 walked all
+//!   records on every query)
 //! - trigram table: fixed 16-byte entries (key, postings len, postings off),
 //!   sorted by key -> binary search
 //! - postings: per trigram, delta-encoded LEB128 file ids, ascending
+//!
+//! Version 1 indexes are rejected with `WrongVersion`; the auto-refresh
+//! before a search then rebuilds them transparently.
 //!
 //! Every read is bounds-checked; a corrupt index yields an error, never UB.
 
@@ -23,9 +30,9 @@ use memmap2::Mmap;
 
 use crate::varint;
 
-pub const MAGIC: &[u8; 8] = b"GRIXIDX1";
-pub const VERSION: u32 = 1;
-const HEADER_LEN: usize = 96;
+pub const MAGIC: &[u8; 8] = b"GRIXIDX2";
+pub const VERSION: u32 = 2;
+const HEADER_LEN: usize = 128;
 
 /// Leftover temps from a crashed build are collected once they are this old.
 /// Far longer than any live build, so an in-flight sibling is never touched.
@@ -52,6 +59,25 @@ pub(crate) fn temp_sibling(index_path: &Path, kind: &str, tag: &str) -> PathBuf 
     let mut name = index_path.as_os_str().to_os_string();
     name.push(format!(".{kind}.{tag}.tmp"));
     PathBuf::from(name)
+}
+
+/// Open for reading with a sequential-access hint. On Windows this sets
+/// FILE_FLAG_SEQUENTIAL_SCAN, which noticeably helps the scan pattern of
+/// "open and read many files front to back"; elsewhere it is a plain open.
+pub(crate) fn open_sequential(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
 }
 
 /// Delete stale build temps (`<index file>.*.tmp`) left behind by crashed
@@ -130,15 +156,49 @@ impl From<io::Error> for IndexError {
     }
 }
 
-/// Write a complete index. `postings` must yield each trigram key with its
-/// sorted, deduplicated file ids, in ascending key order. The posting blob
-/// is streamed through a temp file so peak memory stays at one posting list
-/// plus 16 bytes per trigram, independent of index size.
+/// Streaming source of postings for `write_index`: yields each trigram key
+/// with its sorted, deduplicated file ids, keys strictly ascending.
+/// Lending-style (the slice borrows the source) so producers can reuse one
+/// ids buffer across millions of keys instead of allocating per key.
+pub trait PostingsSource {
+    fn next(&mut self) -> io::Result<Option<(u32, &[u32])>>;
+}
+
+/// Adapter for in-memory (key, ids) sequences (tests, tiny builds).
+pub struct VecPostings {
+    items: std::vec::IntoIter<(u32, Vec<u32>)>,
+    cur: Vec<u32>,
+}
+
+impl VecPostings {
+    pub fn new(items: Vec<(u32, Vec<u32>)>) -> Self {
+        VecPostings {
+            items: items.into_iter(),
+            cur: Vec::new(),
+        }
+    }
+}
+
+impl PostingsSource for VecPostings {
+    fn next(&mut self) -> io::Result<Option<(u32, &[u32])>> {
+        match self.items.next() {
+            None => Ok(None),
+            Some((k, ids)) => {
+                self.cur = ids;
+                Ok(Some((k, &self.cur)))
+            }
+        }
+    }
+}
+
+/// Write a complete index. The posting blob is streamed through a temp file
+/// so peak memory stays at one posting list plus 16 bytes per trigram,
+/// independent of index size.
 pub fn write_index(
     path: &Path,
     root: &str,
     files: &[FileRecord],
-    postings: impl Iterator<Item = io::Result<(u32, Vec<u32>)>>,
+    postings: impl PostingsSource,
 ) -> io::Result<()> {
     let tag = temp_tag();
     let tmp = temp_sibling(path, "new", &tag);
@@ -166,7 +226,7 @@ fn write_index_streamed(
     post_tmp: &Path,
     root: &str,
     files: &[FileRecord],
-    postings: impl Iterator<Item = io::Result<(u32, Vec<u32>)>>,
+    mut postings: impl PostingsSource,
 ) -> io::Result<()> {
     // Encode postings first: the header needs the trigram count and blob
     // length up front. The blob goes to a temp file; only the fixed 16-byte
@@ -177,8 +237,7 @@ fn write_index_streamed(
         let f = File::create(post_tmp)?;
         let mut pw = BufWriter::with_capacity(1 << 20, f);
         let mut buf: Vec<u8> = Vec::new();
-        for item in postings {
-            let (key, ids) = item?;
+        while let Some((key, ids)) = postings.next()? {
             buf.clear();
             let mut prev = 0u32;
             for (i, &id) in ids.iter().enumerate() {
@@ -199,6 +258,15 @@ fn write_index_streamed(
     let f = File::create(tmp)?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
 
+    // Derived section: ids of files a search must always scan. Stored so a
+    // query touches only its candidates, never the whole file table.
+    let scan_always: Vec<u32> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, fr)| fr.flags & FLAG_SCAN_ALWAYS != 0)
+        .map(|(i, _)| i as u32)
+        .collect();
+
     // Lay out variable sections (all lengths are known now).
     let root_off = HEADER_LEN as u64;
     let root_len = root.len() as u64;
@@ -212,11 +280,14 @@ fn write_index_streamed(
     let file_table_off = paths_off + paths_len;
     let file_table_len = files.len() as u64 * 28;
 
-    let tri_table_off = file_table_off + file_table_len;
+    let scan_always_off = file_table_off + file_table_len;
+    let scan_always_len = scan_always.len() as u64 * 4;
+
+    let tri_table_off = scan_always_off + scan_always_len;
     let tri_table_len = tri_count * 16;
     let postings_off = tri_table_off + tri_table_len;
 
-    // Header.
+    // Header (fixed 128 bytes; trailing bytes reserved as zeros).
     w.write_all(MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?; // reserved
@@ -230,6 +301,9 @@ fn write_index_streamed(
     w.write_all(&post_len.to_le_bytes())?;
     w.write_all(&root_off.to_le_bytes())?;
     w.write_all(&root_len.to_le_bytes())?;
+    w.write_all(&scan_always_off.to_le_bytes())?;
+    w.write_all(&(scan_always.len() as u64).to_le_bytes())?;
+    w.write_all(&[0u8; HEADER_LEN - 112])?; // reserved tail
 
     // Sections.
     w.write_all(root.as_bytes())?;
@@ -245,6 +319,9 @@ fn write_index_streamed(
         w.write_all(&fr.mtime.to_le_bytes())?;
         w.write_all(&fr.flags.to_le_bytes())?;
         off_acc += fr.rel_path.len() as u32;
+    }
+    for &id in &scan_always {
+        w.write_all(&id.to_le_bytes())?;
     }
     w.write_all(&tri_table)?;
     let mut pf = File::open(post_tmp)?;
@@ -270,6 +347,8 @@ pub struct IndexReader {
     tri_table_off: usize,
     postings_off: usize,
     root_range: (usize, usize),
+    scan_always_off: usize,
+    scan_always_count: usize,
 }
 
 impl IndexReader {
@@ -285,8 +364,16 @@ impl IndexReader {
 
     fn parse(mmap: Mmap) -> Result<Self, IndexError> {
         let buf: &[u8] = &mmap;
-        if buf.len() < HEADER_LEN || &buf[..8] != MAGIC {
+        if buf.len() < 12 || &buf[..7] != b"GRIXIDX" {
             return Err(IndexError::Corrupt("bad magic"));
+        }
+        if &buf[..8] != MAGIC {
+            // An older grix wrote this; the caller rebuilds it.
+            let v = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            return Err(IndexError::WrongVersion(v));
+        }
+        if buf.len() < HEADER_LEN {
+            return Err(IndexError::Corrupt("truncated header"));
         }
         let u32_at =
             |off: usize| -> u32 { u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) };
@@ -306,6 +393,8 @@ impl IndexReader {
         let postings_len = u64_at(72) as usize;
         let root_off = u64_at(80) as usize;
         let root_len = u64_at(88) as usize;
+        let scan_always_off = u64_at(96) as usize;
+        let scan_always_count = u64_at(104) as usize;
 
         // Validate section bounds once so accessors can stay cheap.
         let need = |off: usize, len: usize, what: &'static str| -> Result<(), IndexError> {
@@ -332,6 +421,16 @@ impl IndexReader {
             "tri table out of bounds",
         )?;
         need(postings_off, postings_len, "postings out of bounds")?;
+        need(
+            scan_always_off,
+            scan_always_count
+                .checked_mul(4)
+                .ok_or(IndexError::Corrupt("scan-always overflow"))?,
+            "scan-always out of bounds",
+        )?;
+        if scan_always_count > file_count {
+            return Err(IndexError::Corrupt("scan-always count out of range"));
+        }
         std::str::from_utf8(&buf[root_off..root_off + root_len])
             .map_err(|_| IndexError::Corrupt("root not utf-8"))?;
 
@@ -344,6 +443,8 @@ impl IndexReader {
             tri_table_off,
             postings_off,
             root_range: (root_off, root_len),
+            scan_always_off,
+            scan_always_count,
         })
     }
 
@@ -363,6 +464,16 @@ impl IndexReader {
 
     pub fn trigram_count(&self) -> usize {
         self.tri_count
+    }
+
+    /// Ids of files a search must always scan (too large to index),
+    /// ascending. O(that list), not O(all files).
+    pub fn scan_always_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        let buf = self.buf();
+        (0..self.scan_always_count).map(move |i| {
+            let e = self.scan_always_off + i * 4;
+            u32::from_le_bytes(buf[e..e + 4].try_into().unwrap())
+        })
     }
 
     pub fn file(&self, id: u32) -> Result<FileMeta<'_>, IndexError> {
@@ -500,7 +611,13 @@ mod tests {
         postings.insert(crate::trigram::pack_str(b"abc"), vec![0u32, 2]);
         postings.insert(crate::trigram::pack_str(b"bcd"), vec![1u32]);
         postings.insert(crate::trigram::pack_str(b"zzz"), vec![0u32, 1, 2]);
-        write_index(&idx, "C:/repo", &files, postings.into_iter().map(Ok)).unwrap();
+        write_index(
+            &idx,
+            "C:/repo",
+            &files,
+            VecPostings::new(postings.into_iter().collect()),
+        )
+        .unwrap();
 
         let r = IndexReader::open(&idx).unwrap();
         assert_eq!(r.root(), "C:/repo");
@@ -508,6 +625,7 @@ mod tests {
         assert_eq!(r.trigram_count(), 3);
         assert_eq!(r.file(0).unwrap().rel_path, "src/main.rs");
         assert_eq!(r.file(2).unwrap().flags, FLAG_SCAN_ALWAYS);
+        assert_eq!(r.scan_always_ids().collect::<Vec<_>>(), vec![2]);
         assert_eq!(
             r.postings(crate::trigram::pack_str(b"abc")).unwrap(),
             vec![0, 2]
@@ -539,6 +657,13 @@ mod tests {
             .collect()
     }
 
+    struct BoomSource;
+    impl PostingsSource for BoomSource {
+        fn next(&mut self) -> io::Result<Option<(u32, &[u32])>> {
+            Err(io::Error::other("boom"))
+        }
+    }
+
     #[test]
     fn failed_write_keeps_index_and_leaves_no_temps() {
         let dir = tempfile::tempdir().unwrap();
@@ -546,11 +671,16 @@ mod tests {
         let files = sample_files();
         let mut postings = BTreeMap::new();
         postings.insert(crate::trigram::pack_str(b"abc"), vec![0u32]);
-        write_index(&idx, "r", &files, postings.into_iter().map(Ok)).unwrap();
+        write_index(
+            &idx,
+            "r",
+            &files,
+            VecPostings::new(postings.into_iter().collect()),
+        )
+        .unwrap();
         assert!(temp_leftovers(dir.path()).is_empty());
 
-        let boom = std::iter::once(Err(io::Error::other("boom")));
-        assert!(write_index(&idx, "r", &files, boom).is_err());
+        assert!(write_index(&idx, "r", &files, BoomSource).is_err());
         // The failed attempt must not clobber the live index nor leave temps.
         assert!(IndexReader::open(&idx).is_ok());
         assert!(

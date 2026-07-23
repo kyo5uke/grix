@@ -323,6 +323,16 @@ fn cmd_status(path: Option<&Path>) -> Result<(), String> {
     let start = path.unwrap_or(Path::new("."));
     match store::find_index_upward(start) {
         Some((idx, root)) => {
+            if let Err(grix::index::format::IndexError::WrongVersion(v)) =
+                IndexReader::open(&idx)
+            {
+                println!("root:     {}", root.display());
+                println!("index:    {} (old format v{v})", idx.display());
+                println!(
+                    "          the next search rebuilds it automatically (or run: grix index)"
+                );
+                return Ok(());
+            }
             let reader = IndexReader::open(&idx).map_err(|e| e.to_string())?;
             let size = std::fs::metadata(&idx).map(|m| m.len()).unwrap_or(0);
             println!("root:     {}", root.display());

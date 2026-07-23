@@ -99,44 +99,71 @@ logic that provably preserves semantics.
 
 One file per indexed root, in your cache directory (`%LOCALAPPDATA%\grix`
 or `~/.cache/grix`) — repositories are never touched. Little-endian,
-mmap-friendly:
+mmap-friendly (format `GRIXIDX2`):
 
 ```
-[magic][header][root path][paths blob][file table][trigram table][postings]
+[magic][header][root path][paths blob][file table][scan-always ids]
+[trigram table][postings]
 ```
 
 - **file table**: fixed-width entries (path, size, mtime, flags) — the
   flags mark binary files (excluded) and oversized files (always scanned).
+- **scan-always ids**: the (usually tiny) list of oversized-file ids as its
+  own section, so a query only ever touches its candidates' metadata — no
+  per-search walk over the whole file table.
 - **trigram table**: sorted fixed-width entries; a posting list is found by
   binary search and decoded lazily.
 - **postings**: per-trigram sorted file ids, delta + LEB128 encoded.
   The linux kernel source (92,823 files, ~1.4 GB) indexes to 162 MiB with
   this scheme.
 
+Older index versions are rejected on open with a version error; the
+before-search refresh then rebuilds them transparently.
+
 Every read is bounds-checked; a corrupted index produces an error (and a
 rebuild hint), never undefined behavior.
+
+## The build pipeline
+
+Building is a sort, not a hash join:
+
+1. The tree is walked **in parallel** (gitignore-aware); candidates are
+   sorted by path so file ids are deterministic.
+2. Worker threads read files and find each file's distinct trigrams with a
+   reusable 2^24-bit bitmap — O(bytes), no per-file sorting — and emit
+   packed `(trigram, file id)` u64 pairs in large batches.
+3. Pairs accumulate under a memory budget; over budget the buffer is sorted
+   once and spilled as a raw sorted run.
+4. At write time the in-memory run, the spilled runs and (for incremental
+   builds) the old index — streamed as one pre-sorted, id-remapped run —
+   are k-way merged straight into the on-disk postings encoder.
+
+No hash map or per-trigram allocation exists anywhere on this path, and
+peak memory stays bounded no matter how large the tree is.
 
 ## Incremental updates
 
 `grix index` on an already-indexed tree:
 
-1. Walk the tree, collect (path, size, mtime), sort by path.
-2. Files whose (size, mtime) match the old index are **reused**: one linear
-   pass over the old posting lists remaps their ids into the new file table
-   — their bytes are never read again. The remap preserves sort order, so
-   posting lists stay sorted by construction.
-3. Only new/changed files are read and extracted (in parallel).
-
-In practice this makes a refresh ~20× faster than the initial build on a
-typical working tree.
+1. Walk the tree (parallel), collect (path, size, mtime), sort by path.
+2. If nothing changed at all, stop — the index file is not rewritten.
+3. Files whose (size, mtime) match the old index are **reused**: their
+   postings stream out of the old index with ids remapped, as one merge
+   input — their bytes are never read again. The remap preserves sort
+   order, so posting lists stay sorted by construction.
+4. Only new/changed files are read and extracted (in parallel).
 
 ## The confirming scan
 
 Candidates are scanned with [`regex`](https://docs.rs/regex)'s `bytes` API
-across a work-stealing thread pool. Match offsets are mapped to line
-numbers in a single forward pass (the newline counter doubles as the
-line-start anchor, so even pathological empty-match patterns stay linear).
-Files over 8 MiB are mmap'd instead of read.
+across a work-stealing thread pool. The pool is deliberately oversubscribed
+(4× cores): on Windows the dominant cost is opening files, which blocks its
+thread, so extra threads overlap that syscall latency. Files are opened with
+a sequential-access hint and read into buffers pre-sized from the index's
+own metadata. Match offsets are mapped to line numbers in a single forward
+pass (the newline counter doubles as the line-start anchor, so even
+pathological empty-match patterns stay linear). Files over 8 MiB are mmap'd
+instead of read.
 
 Output mirrors ripgrep: headings on a tty, `path:line:text` when piped,
 `--json` for machines, exit codes 0/1/2 (match/no match/error).

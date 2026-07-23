@@ -103,21 +103,23 @@ search costs when the tree hasn't changed.
 
 | pattern | matched lines | ripgrep | grix | speedup |
 | --- | ---: | ---: | ---: | ---: |
-| `PageTransHuge` (rare literal) | 5 | 2.31 s | 97 ms | 23.7× |
-| `EXPORT_SYMBOL` (common literal) | 38,267 | 2.29 s | 195 ms | 11.7× |
-| `static\s+int\s+\w+_probe` (regex) | 10,081 | 2.10 s | 288 ms | 7.3× |
-| `spinlock` (`-i`) | 17,086 | 2.23 s | 223 ms | 10.0× |
-| `zzqqxx_does_not_exist` (no match) | 0 | 2.09 s | 41 ms | 50.5× |
+| `PageTransHuge` (rare literal) | 5 | 2.78 s | 15 ms | 181× |
+| `EXPORT_SYMBOL` (common literal) | 38,267 | 2.41 s | 174 ms | 13.9× |
+| `static\s+int\s+\w+_probe` (regex) | 10,081 | 2.40 s | 301 ms | 8.0× |
+| `spinlock` (`-i`) | 17,086 | 2.41 s | 217 ms | 11.1× |
+| `zzqqxx_does_not_exist` (no match) | 0 | 2.36 s | 16 ms | 145× |
 
 The index is 162 MiB.
-The first build took about 26 seconds.
-With a cold filesystem cache it took about 90 seconds.
+A from-scratch build takes about 10 seconds with a warm filesystem cache
+(cold-cache builds are I/O-bound and vary with the disk).
 
-An unchanged `grix index` takes about 2.4 seconds.
-In that case it does not re-read any file contents.
+An unchanged `grix index` takes about 0.35 seconds — a parallel directory
+walk and nothing else. It re-reads no file contents and does not rewrite
+the index file.
 
 There are Linux numbers too.
-These are from a stock GitHub Actions runner with 4 cores.
+These are from a stock GitHub Actions runner with 4 cores, measured on
+v0.3.2 (before the current index engine, so expect them to improve).
 The log is [public](https://github.com/kyo5uke/grix/actions/runs/27286573555).
 
 | pattern | ripgrep | grix | speedup |
@@ -172,7 +174,7 @@ The flag set is still small.
 
 | supported | not yet |
 | --- | --- |
-| `-i`, `-F`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `--json`, `--no-heading`, `--color` | `-U`, `--replace` |
+| `-i`, `-F`, `-e`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `--`, `--json`, `--no-heading`, `--color` | `-U`, `--replace` |
 
 If grix and ripgrep disagree on matched lines within the supported set, please
 open an issue.

@@ -1,20 +1,20 @@
 //! Index construction: full builds and incremental updates.
 //!
-//! Build pipeline:
-//! 1. Walk the tree (gitignore-aware) and collect candidate files, sorted by
-//!    relative path so file ids are deterministic.
+//! Build pipeline (the "pair pipeline"):
+//! 1. Walk the tree in parallel (gitignore-aware) and collect candidates,
+//!    sorted by relative path so file ids are deterministic.
 //! 2. For an incremental update, files whose (size, mtime) match the old
-//!    index are *reused*: their postings are recovered from the old index in
-//!    one linear pass (old id -> new id remap) without touching the files.
-//! 3. Changed/new files are read and trigram-extracted in parallel; results
-//!    are merged as they arrive, never accumulated.
-//! 4. Posting lists are kept under a memory budget: when the in-memory map
-//!    exceeds `BuildOptions::spill_budget` it is flushed to a sorted temp
-//!    shard and the shards are k-way merged at write time, so build memory
-//!    stays bounded no matter how large the tree is.
+//!    index are *reused*: their postings stream out of the old index as one
+//!    pre-sorted run (old id -> new id remap) without touching the files.
+//! 3. Changed/new files are read in parallel; each file's distinct trigrams
+//!    are found with a reusable bitmap (no per-file sort) and emitted as
+//!    packed `(trigram << 32) | file_id` u64 pairs, batched to the collector.
+//! 4. Pairs accumulate under `BuildOptions::spill_budget`; over budget the
+//!    buffer is sorted once and written as a raw sorted run. At write time
+//!    the in-memory run, the spilled runs and the old-index run are k-way
+//!    merged into the final (key, ids) stream — no hash map anywhere.
 //! 5. The merged stream is written atomically (see `format::write_index`).
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -23,9 +23,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::UNIX_EPOCH;
 
-use super::format::{self, FileRecord, IndexReader, FLAG_BINARY, FLAG_SCAN_ALWAYS};
-use crate::trigram;
-use crate::varint;
+use super::format::{self, FileRecord, IndexReader, PostingsSource, FLAG_BINARY, FLAG_SCAN_ALWAYS};
+use crate::trigram::{self, TriSet};
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -42,7 +41,11 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         BuildOptions {
-            max_file_size: 16 << 20,
+            // 64 MiB: generous enough that virtually everything in a source
+            // tree is indexed. Every scan-always file is re-scanned by every
+            // query, so an unindexed 20 MB header would put a floor under
+            // all search latencies (measured: ~30 ms on the kernel tree).
+            max_file_size: 64 << 20,
             threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
@@ -63,10 +66,10 @@ pub struct BuildStats {
     pub bytes_read: u64,
 }
 
-struct Candidate {
-    rel_path: String,
-    size: u64,
-    mtime: u64,
+pub struct Candidate {
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime: u64,
 }
 
 fn mtime_nanos(md: &std::fs::Metadata) -> u64 {
@@ -77,57 +80,108 @@ fn mtime_nanos(md: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Walk `root` and return indexable candidates sorted by relative path.
-fn collect_candidates(root: &Path) -> io::Result<Vec<Candidate>> {
-    let mut out = Vec::new();
-    let walker = ignore::WalkBuilder::new(root).build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue, // unreadable entries are skipped, not fatal
-        };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
+/// `/`-separated relative path in one allocation.
+fn rel_string(rel: &Path) -> String {
+    let mut out = String::with_capacity(rel.as_os_str().len());
+    for c in rel.components() {
+        if !out.is_empty() {
+            out.push('/');
         }
-        let md = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let rel = match entry.path().strip_prefix(root) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let rel_path = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        if rel_path.is_empty() {
-            continue;
-        }
-        out.push(Candidate {
-            rel_path,
-            size: md.len(),
-            mtime: mtime_nanos(&md),
-        });
+        out.push_str(&c.as_os_str().to_string_lossy());
     }
+    out
+}
+
+/// Walk `root` in parallel and return indexable candidates sorted by
+/// relative path (ids stay deterministic regardless of traversal order).
+/// Directory walks are syscall-bound — on Windows especially — so the
+/// parallel walker is the single biggest lever for refresh latency.
+pub fn collect_candidates(root: &Path, threads: usize) -> io::Result<Vec<Candidate>> {
+    let (tx, rx) = mpsc::channel::<Candidate>();
+    let walker = ignore::WalkBuilder::new(root)
+        .threads(threads.max(1))
+        .build_parallel();
+    walker.run(|| {
+        let tx = tx.clone();
+        let root = root.to_path_buf();
+        Box::new(move |entry| {
+            // Unreadable entries are skipped, not fatal.
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(md) = entry.metadata() else {
+                return ignore::WalkState::Continue;
+            };
+            let Ok(rel) = entry.path().strip_prefix(&root) else {
+                return ignore::WalkState::Continue;
+            };
+            let rel_path = rel_string(rel);
+            if !rel_path.is_empty() {
+                let _ = tx.send(Candidate {
+                    rel_path,
+                    size: md.len(),
+                    mtime: mtime_nanos(&md),
+                });
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    drop(tx);
+    let mut out: Vec<Candidate> = rx.into_iter().collect();
     out.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(out)
 }
 
-enum Extracted {
-    Indexed(Vec<u32>),
-    Binary,
+/// One batch of extraction results, sent worker -> collector. Batching keeps
+/// channel traffic to a few messages per MiB instead of one per file.
+#[derive(Default)]
+struct WorkMsg {
+    /// Packed `(trigram << 32) | file_id` pairs.
+    pairs: Vec<u64>,
+    /// Files that turned out binary (or vanished mid-build).
+    binaries: Vec<u32>,
+    bytes: u64,
 }
 
-/// Read + classify + extract one file. Returns the extraction and bytes read.
-fn extract_file(abs: &Path) -> io::Result<(Extracted, u64)> {
-    let data = std::fs::read(abs)?;
-    if trigram::looks_binary(&data) {
-        return Ok((Extracted::Binary, 0));
+/// Pairs per message: 512K pairs = 4 MiB.
+const FLUSH_PAIRS: usize = 1 << 19;
+
+#[inline]
+fn pack_pair(t: u32, id: u32) -> u64 {
+    (u64::from(t) << 32) | u64::from(id)
+}
+
+#[inline]
+fn pair_key(p: u64) -> u32 {
+    (p >> 32) as u32
+}
+
+/// Read a whole file with a pre-sized buffer (the walk already knows the
+/// size) and a sequential-access hint.
+fn read_file(abs: &Path, size_hint: u64) -> io::Result<Vec<u8>> {
+    let mut f = format::open_sequential(abs)?;
+    let mut v = Vec::with_capacity(size_hint as usize + 16);
+    f.read_to_end(&mut v)?;
+    Ok(v)
+}
+
+/// Emit one file's distinct trigrams as pairs. O(bytes), no sorting: the
+/// global run sort orders everything at once later.
+fn extract_pairs(data: &[u8], id: u32, tri: &mut TriSet, out: &mut Vec<u64>) {
+    if data.len() < 3 {
+        return;
     }
-    let bytes = data.len() as u64;
-    Ok((Extracted::Indexed(trigram::extract_sorted(&data)), bytes))
+    let mut t = (u32::from(data[0]) << 8) | u32::from(data[1]);
+    for &b in &data[2..] {
+        t = ((t << 8) | u32::from(b)) & 0x00ff_ffff;
+        if tri.insert(t) {
+            out.push(pack_pair(t, id));
+        }
+    }
+    tri.clear();
 }
 
 /// Build (or incrementally rebuild) the index for `root` into `index_path`.
@@ -137,11 +191,29 @@ pub fn build(
     old: Option<&IndexReader>,
     opts: &BuildOptions,
 ) -> io::Result<BuildStats> {
+    match build_inner(root, index_path, old, opts) {
+        // A corrupt old index surfaces as InvalidData while its postings
+        // stream through the merge; retry once from scratch (the same
+        // recovery semantics as an upfront validation, without paying a
+        // full decode on every healthy build).
+        Err(e) if old.is_some() && e.kind() == io::ErrorKind::InvalidData => {
+            build_inner(root, index_path, None, opts)
+        }
+        r => r,
+    }
+}
+
+fn build_inner(
+    root: &Path,
+    index_path: &Path,
+    old: Option<&IndexReader>,
+    opts: &BuildOptions,
+) -> io::Result<BuildStats> {
     let mut stats = BuildStats::default();
     // Reclaim temps a crashed build may have left next to the index (their
     // names are unique per attempt, so nothing else ever overwrites them).
     format::sweep_stale_temps(index_path);
-    let candidates = collect_candidates(root)?;
+    let candidates = collect_candidates(root, opts.threads)?;
     stats.files_total = candidates.len();
 
     // Map old files by path for change detection.
@@ -158,8 +230,8 @@ pub fn build(
     let mut records: Vec<FileRecord> = Vec::with_capacity(candidates.len());
     // old id -> new id (u32::MAX = dropped / re-extracted)
     let mut remap: Vec<u32> = vec![u32::MAX; old.map_or(0, |o| o.file_count())];
-    // (new_id, rel_path) pending extraction
-    let mut to_extract: Vec<(u32, String)> = Vec::new();
+    // (new_id, rel_path, size) pending extraction
+    let mut to_extract: Vec<(u32, String, u64)> = Vec::new();
 
     for cand in &candidates {
         let new_id = records.len() as u32;
@@ -188,7 +260,7 @@ pub fn build(
                 }
             }
             None if too_large => {}
-            None => to_extract.push((new_id, cand.rel_path.clone())),
+            None => to_extract.push((new_id, cand.rel_path.clone(), cand.size)),
         }
 
         records.push(FileRecord {
@@ -212,91 +284,62 @@ pub fn build(
         return Ok(stats);
     }
 
-    // Bounded postings accumulator; overflow goes to temp shards.
-    let mut acc = PostingsAcc::new(index_path, opts.spill_budget);
+    // Corrupt-old-index detection needs the classification to be redone from
+    // scratch (see `build`), so nothing below may mutate `remap`.
+    let remap = remap;
 
-    // Postings recovered from the old index in one linear pass.
-    if let Some(old) = old {
-        for item in old.iter_postings() {
-            let (key, ids) = match item {
-                Ok(kv) => kv,
-                Err(_) => {
-                    // Corrupt old index: fall back to a full rebuild.
-                    acc.reset()?;
-                    for r in remap.iter_mut() {
-                        *r = u32::MAX;
-                    }
-                    let mut seen: std::collections::HashSet<u32> =
-                        to_extract.iter().map(|(id, _)| *id).collect();
-                    for (i, rec) in records.iter().enumerate() {
-                        let id = i as u32;
-                        if rec.flags == 0 && !seen.contains(&id) {
-                            to_extract.push((id, rec.rel_path.clone()));
-                            seen.insert(id);
-                        }
-                    }
-                    stats.files_reused = 0;
-                    break;
-                }
-            };
-            // Survivors keep their relative order, so the remapped list
-            // stays sorted.
-            let mapped: Vec<u32> = ids
-                .into_iter()
-                .filter_map(|oid| {
-                    let nid = remap[oid as usize];
-                    (nid != u32::MAX).then_some(nid)
-                })
-                .collect();
-            if !mapped.is_empty() {
-                acc.add_list(key, mapped)?;
-            }
-        }
-    }
-
-    // Parallel extraction of changed/new files. Results are drained here as
-    // they arrive so per-file trigram sets never pile up in memory; the
+    // Parallel extraction of changed/new files. Workers emit batched pair
+    // messages; this thread accumulates them under the spill budget. The
     // bounded channel provides backpressure while a spill is in progress.
     stats.files_extracted = to_extract.len();
+    let mut acc = PairAcc::new(index_path, opts.spill_budget);
     let next = AtomicUsize::new(0);
     let nthreads = opts.threads.max(1).min(to_extract.len().max(1));
-    let (tx, rx) = mpsc::sync_channel::<(u32, Extracted, u64)>(nthreads * 2);
+    let (tx, rx) = mpsc::sync_channel::<WorkMsg>(nthreads);
     let mut drain_err: Option<io::Error> = None;
     std::thread::scope(|s| {
         for _ in 0..nthreads {
             let tx = tx.clone();
             let next = &next;
             let to_extract = &to_extract;
-            s.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some((new_id, rel)) = to_extract.get(i) else {
-                    break;
-                };
-                let abs = root.join(rel);
-                let msg = match extract_file(&abs) {
-                    Ok((ex, bytes)) => (*new_id, ex, bytes),
-                    // File vanished or unreadable: mark binary so it is
-                    // excluded from search rather than half-indexed.
-                    Err(_) => (*new_id, Extracted::Binary, 0),
-                };
-                if tx.send(msg).is_err() {
-                    break; // receiver bailed on an io error
+            s.spawn(move || {
+                let mut tri = TriSet::new();
+                let mut msg = WorkMsg::default();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((new_id, rel, size)) = to_extract.get(i) else {
+                        break;
+                    };
+                    let abs = root.join(rel);
+                    match read_file(&abs, *size) {
+                        Ok(data) if !trigram::looks_binary(&data) => {
+                            msg.bytes += data.len() as u64;
+                            extract_pairs(&data, *new_id, &mut tri, &mut msg.pairs);
+                        }
+                        // Binary, vanished or unreadable: exclude from
+                        // search rather than half-index it.
+                        _ => msg.binaries.push(*new_id),
+                    }
+                    if msg.pairs.len() >= FLUSH_PAIRS
+                        && tx.send(std::mem::take(&mut msg)).is_err()
+                    {
+                        return; // receiver bailed on an io error
+                    }
+                }
+                if !msg.pairs.is_empty() || !msg.binaries.is_empty() || msg.bytes > 0 {
+                    let _ = tx.send(msg);
                 }
             });
         }
         drop(tx);
-        for (new_id, ex, bytes) in rx {
-            stats.bytes_read += bytes;
-            match ex {
-                Extracted::Binary => {
-                    records[new_id as usize].flags = FLAG_BINARY;
-                }
-                Extracted::Indexed(tris) => {
-                    if let Err(e) = acc.add_file(new_id, &tris) {
-                        drain_err = Some(e);
-                        break;
-                    }
-                }
+        for msg in rx {
+            stats.bytes_read += msg.bytes;
+            for id in msg.binaries {
+                records[id as usize].flags = FLAG_BINARY;
+            }
+            if let Err(e) = acc.extend(msg.pairs) {
+                drain_err = Some(e);
+                break;
             }
         }
     });
@@ -306,11 +349,16 @@ pub fn build(
 
     fill_flag_stats(&mut stats, &records);
 
-    // Sorted postings stream: in-memory for small builds, k-way shard merge
-    // for spilled ones. The guard deletes shard files after the write.
-    let (postings, _shards) = acc.into_postings()?;
+    // Merge the in-memory run, spilled runs and the old-index run into one
+    // sorted (key, ids) stream. The guard deletes shard files after the
+    // write completes.
+    let old_run = match old {
+        Some(o) => Some(OldRun::new(o, &remap)?),
+        None => None,
+    };
+    let (merged, _guard) = acc.into_source(old_run)?;
     let root_str = root.to_string_lossy().replace('\\', "/");
-    format::write_index(index_path, &root_str, &records, postings)?;
+    format::write_index(index_path, &root_str, &records, merged)?;
     Ok(stats)
 }
 
@@ -326,79 +374,35 @@ fn fill_flag_stats(stats: &mut BuildStats, records: &[FileRecord]) {
         .count();
 }
 
-/// Approximate per-new-trigram bookkeeping cost (map slot + vec header).
-const KEY_OVERHEAD: usize = 64;
-
-/// Bounded (trigram -> file ids) accumulator. Ids arrive in completion
-/// order; each spill sorts + dedups its keys and writes one shard file, so
-/// peak memory stays near `budget` however many text files the tree has.
-struct PostingsAcc {
-    map: HashMap<u32, Vec<u32>>,
-    payload: usize,
-    budget: usize,
+/// Bounded pair accumulator. Batches of packed `(trigram << 32) | id` pairs
+/// arrive in completion order; over budget the buffer is sorted once and
+/// written out as a raw little-endian u64 run, so peak memory stays near
+/// `budget` however many text files the tree has.
+struct PairAcc {
+    pairs: Vec<u64>,
+    /// Spill threshold in pairs (budget bytes / 8).
+    cap: usize,
     index_path: PathBuf,
     /// Unique per build attempt so concurrent builds never share shard files.
     tag: String,
     shards: Vec<PathBuf>,
 }
 
-impl PostingsAcc {
+impl PairAcc {
     fn new(index_path: &Path, budget: usize) -> Self {
-        PostingsAcc {
-            map: HashMap::new(),
-            payload: 0,
-            budget: budget.max(1),
+        PairAcc {
+            pairs: Vec::new(),
+            cap: (budget / 8).max(1),
             index_path: index_path.to_path_buf(),
             tag: format::temp_tag(),
             shards: Vec::new(),
         }
     }
 
-    fn push(&mut self, key: u32, id: u32) {
-        match self.map.entry(key) {
-            Entry::Occupied(mut e) => e.get_mut().push(id),
-            Entry::Vacant(e) => {
-                e.insert(vec![id]);
-                self.payload += KEY_OVERHEAD;
-            }
-        }
-        self.payload += 4;
-    }
-
-    /// One extracted file's sorted distinct trigrams.
-    fn add_file(&mut self, id: u32, tris: &[u32]) -> io::Result<()> {
-        for &t in tris {
-            self.push(t, id);
-        }
-        self.spill_if_over()
-    }
-
-    /// Sorted, deduplicated ids recovered from the old index.
-    fn add_list(&mut self, key: u32, ids: Vec<u32>) -> io::Result<()> {
-        self.payload += 4 * ids.len();
-        match self.map.entry(key) {
-            Entry::Occupied(mut e) => e.get_mut().extend(ids),
-            Entry::Vacant(e) => {
-                e.insert(ids);
-                self.payload += KEY_OVERHEAD;
-            }
-        }
-        self.spill_if_over()
-    }
-
-    fn spill_if_over(&mut self) -> io::Result<()> {
-        if self.payload > self.budget {
+    fn extend(&mut self, mut batch: Vec<u64>) -> io::Result<()> {
+        self.pairs.append(&mut batch);
+        if self.pairs.len() >= self.cap {
             self.spill()?;
-        }
-        Ok(())
-    }
-
-    /// Drop everything accumulated so far (corrupt-old-index fallback).
-    fn reset(&mut self) -> io::Result<()> {
-        self.map = HashMap::new();
-        self.payload = 0;
-        for p in self.shards.drain(..) {
-            let _ = std::fs::remove_file(p);
         }
         Ok(())
     }
@@ -407,75 +411,53 @@ impl PostingsAcc {
         format::temp_sibling(&self.index_path, &format!("shard{n}"), &self.tag)
     }
 
-    /// Flush the in-memory map as one shard: records of
-    /// [key u32][id count u32][delta-varint ids], keys ascending.
+    /// Sort the buffer and write it as one raw sorted u64 run.
     fn spill(&mut self) -> io::Result<()> {
-        if self.map.is_empty() {
+        if self.pairs.is_empty() {
             return Ok(());
         }
+        self.pairs.sort_unstable();
         let path = self.shard_path(self.shards.len());
-        let mut keys: Vec<u32> = self.map.keys().copied().collect();
-        keys.sort_unstable();
         let f = File::create(&path)?;
         let mut w = BufWriter::with_capacity(1 << 20, f);
-        let mut buf: Vec<u8> = Vec::new();
-        for k in keys {
-            let mut ids = self.map.remove(&k).unwrap();
-            ids.sort_unstable();
-            ids.dedup();
-            buf.clear();
-            let mut prev = 0u32;
-            for (i, &id) in ids.iter().enumerate() {
-                let delta = if i == 0 { id } else { id - prev };
-                varint::write_u64(&mut buf, u64::from(delta));
-                prev = id;
-            }
-            w.write_all(&k.to_le_bytes())?;
-            w.write_all(&(ids.len() as u32).to_le_bytes())?;
-            w.write_all(&buf)?;
+        for &p in &self.pairs {
+            w.write_all(&p.to_le_bytes())?;
         }
         w.flush()?;
-        self.map = HashMap::new(); // release the emptied table's capacity too
-        self.payload = 0;
+        // Keep the capacity: it is the accounted budget and will refill.
+        self.pairs.clear();
         self.shards.push(path);
         Ok(())
     }
 
-    /// Consume into a sorted postings stream plus a guard that deletes the
-    /// shard files once the stream has been consumed and dropped.
-    fn into_postings(mut self) -> io::Result<(PostingsIter, ShardGuard)> {
-        if self.shards.is_empty() {
-            // Small build: same pure in-memory path as before spilling existed.
-            let mut keys: Vec<u32> = self.map.keys().copied().collect();
-            keys.sort_unstable();
-            let mut ordered: Vec<(u32, Vec<u32>)> = Vec::with_capacity(keys.len());
-            for k in keys {
-                let mut ids = self.map.remove(&k).unwrap();
-                ids.sort_unstable();
-                ids.dedup();
-                ordered.push((k, ids));
-            }
-            return Ok((
-                PostingsIter::Mem(ordered.into_iter()),
-                ShardGuard(Vec::new()),
-            ));
-        }
-        self.spill()?; // flush the remainder
+    /// Consume into the merged (key, ids) stream plus a guard that deletes
+    /// the shard files once the stream has been consumed and dropped.
+    fn into_source<'a>(mut self, old: Option<OldRun<'a>>) -> io::Result<(Merged<'a>, ShardGuard)> {
+        // The in-memory remainder merges directly; no need to round-trip it
+        // through disk.
+        self.pairs.sort_unstable();
         let mut cursors = Vec::with_capacity(self.shards.len());
         for p in &self.shards {
             let mut c = ShardCursor {
-                r: BufReader::with_capacity(64 << 10, File::open(p)?),
+                r: BufReader::with_capacity(1 << 20, File::open(p)?),
                 next: None,
             };
             c.advance()?;
             cursors.push(c);
         }
         let guard = ShardGuard(std::mem::take(&mut self.shards));
-        Ok((PostingsIter::Merge(MergeCursors { cursors }), guard))
+        let merged = Merged {
+            mem: std::mem::take(&mut self.pairs),
+            mem_pos: 0,
+            shards: cursors,
+            old,
+            ids: Vec::new(),
+        };
+        Ok((merged, guard))
     }
 }
 
-impl Drop for PostingsAcc {
+impl Drop for PairAcc {
     fn drop(&mut self) {
         for p in self.shards.drain(..) {
             let _ = std::fs::remove_file(p);
@@ -494,101 +476,155 @@ impl Drop for ShardGuard {
     }
 }
 
+/// Buffered cursor over one raw sorted u64 run.
 struct ShardCursor {
     r: BufReader<File>,
-    next: Option<(u32, Vec<u32>)>,
+    next: Option<u64>,
 }
 
 impl ShardCursor {
     fn advance(&mut self) -> io::Result<()> {
-        let mut kb = [0u8; 4];
-        match self.r.read_exact(&mut kb) {
-            Ok(()) => {}
+        let mut b = [0u8; 8];
+        match self.r.read_exact(&mut b) {
+            Ok(()) => {
+                self.next = Some(u64::from_le_bytes(b));
+                Ok(())
+            }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 self.next = None;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+type OldPostings<'a> = Box<dyn Iterator<Item = Result<(u32, Vec<u32>), format::IndexError>> + 'a>;
+
+/// The old index streamed as a pre-sorted run: keys ascending, ids remapped
+/// to new ids (survivors keep their relative order, so lists stay sorted).
+/// Decode errors surface as `InvalidData`, which `build` turns into a
+/// from-scratch rebuild.
+struct OldRun<'a> {
+    it: OldPostings<'a>,
+    remap: &'a [u32],
+    /// Next remapped, non-empty group.
+    next: Option<(u32, Vec<u32>)>,
+}
+
+impl<'a> OldRun<'a> {
+    fn new(old: &'a IndexReader, remap: &'a [u32]) -> io::Result<Self> {
+        let mut run = OldRun {
+            it: Box::new(old.iter_postings()),
+            remap,
+            next: None,
+        };
+        run.advance()?;
+        Ok(run)
+    }
+
+    fn advance(&mut self) -> io::Result<()> {
+        self.next = None;
+        let remap = self.remap;
+        for item in self.it.by_ref() {
+            let (key, ids) =
+                item.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let mapped: Vec<u32> = ids
+                .into_iter()
+                .filter_map(|oid| {
+                    let nid = remap[oid as usize];
+                    (nid != u32::MAX).then_some(nid)
+                })
+                .collect();
+            if !mapped.is_empty() {
+                self.next = Some((key, mapped));
                 return Ok(());
             }
-            Err(e) => return Err(e),
         }
-        let key = u32::from_le_bytes(kb);
-        let mut cb = [0u8; 4];
-        self.r.read_exact(&mut cb)?;
-        let count = u32::from_le_bytes(cb) as usize;
-        let mut ids = Vec::with_capacity(count);
-        let mut prev = 0u64;
-        for i in 0..count {
-            let delta = read_varint(&mut self.r)?;
-            let id = if i == 0 { delta } else { prev + delta };
-            ids.push(id as u32);
-            prev = id;
-        }
-        self.next = Some((key, ids));
         Ok(())
     }
 }
 
-fn read_varint(r: &mut impl Read) -> io::Result<u64> {
-    let mut v = 0u64;
-    let mut shift = 0u32;
-    loop {
-        let mut b = [0u8; 1];
-        r.read_exact(&mut b)?;
-        if shift >= 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "overlong varint in shard",
-            ));
-        }
-        v |= u64::from(b[0] & 0x7f) << shift;
-        if b[0] & 0x80 == 0 {
-            return Ok(v);
-        }
-        shift += 7;
-    }
+/// K-way merge of the in-memory run, spilled runs and the old-index run
+/// into the final sorted (key, ids) stream. One reusable ids buffer serves
+/// every key.
+struct Merged<'a> {
+    mem: Vec<u64>,
+    mem_pos: usize,
+    shards: Vec<ShardCursor>,
+    old: Option<OldRun<'a>>,
+    ids: Vec<u32>,
 }
 
-struct MergeCursors {
-    cursors: Vec<ShardCursor>,
-}
-
-impl MergeCursors {
-    fn next_merged(&mut self) -> io::Result<Option<(u32, Vec<u32>)>> {
-        let Some(min) = self
-            .cursors
-            .iter()
-            .filter_map(|c| c.next.as_ref().map(|(k, _)| *k))
-            .min()
-        else {
-            return Ok(None);
-        };
-        let mut ids: Vec<u32> = Vec::new();
-        for c in &mut self.cursors {
-            if c.next.as_ref().is_some_and(|(k, _)| *k == min) {
-                let (_, list) = c.next.take().unwrap();
-                ids.extend(list);
-                c.advance()?;
+impl PostingsSource for Merged<'_> {
+    fn next(&mut self) -> io::Result<Option<(u32, &[u32])>> {
+        // Minimum key across all runs.
+        let mut key = u32::MAX;
+        let mut any = false;
+        if let Some(&p) = self.mem.get(self.mem_pos) {
+            key = key.min(pair_key(p));
+            any = true;
+        }
+        for c in &self.shards {
+            if let Some(p) = c.next {
+                key = key.min(pair_key(p));
+                any = true;
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(Some((min, ids)))
-    }
-}
-
-/// Sorted (key, ids) stream fed to `format::write_index`.
-enum PostingsIter {
-    Mem(std::vec::IntoIter<(u32, Vec<u32>)>),
-    Merge(MergeCursors),
-}
-
-impl Iterator for PostingsIter {
-    type Item = io::Result<(u32, Vec<u32>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            PostingsIter::Mem(it) => it.next().map(Ok),
-            PostingsIter::Merge(m) => m.next_merged().transpose(),
+        if let Some(o) = &self.old {
+            if let Some((k, _)) = &o.next {
+                key = key.min(*k);
+                any = true;
+            }
         }
+        if !any {
+            return Ok(None);
+        }
+
+        // Collect this key's ids from every run. Each run's ids are already
+        // ascending; with more than one contributing run the concatenation
+        // needs one sort.
+        self.ids.clear();
+        let mut sources = 0u32;
+        if self
+            .mem
+            .get(self.mem_pos)
+            .is_some_and(|&p| pair_key(p) == key)
+        {
+            sources += 1;
+            while let Some(&p) = self.mem.get(self.mem_pos) {
+                if pair_key(p) != key {
+                    break;
+                }
+                self.ids.push(p as u32);
+                self.mem_pos += 1;
+            }
+        }
+        for c in &mut self.shards {
+            if c.next.is_some_and(|p| pair_key(p) == key) {
+                sources += 1;
+                while let Some(p) = c.next {
+                    if pair_key(p) != key {
+                        break;
+                    }
+                    self.ids.push(p as u32);
+                    c.advance()?;
+                }
+            }
+        }
+        if let Some(o) = &mut self.old {
+            if o.next.as_ref().is_some_and(|(k, _)| *k == key) {
+                sources += 1;
+                let (_, mut ids) = o.next.take().unwrap();
+                self.ids.append(&mut ids);
+                o.advance()?;
+            }
+        }
+        if sources > 1 {
+            self.ids.sort_unstable();
+            self.ids.dedup();
+        }
+        Ok(Some((key, &self.ids)))
     }
 }
 
