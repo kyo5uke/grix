@@ -112,15 +112,16 @@ search costs when the tree hasn't changed.
 | `spinlock` (`-i`) | 17,086 | 2.41 s | 217 ms | 11.1× |
 | `zzqqxx_does_not_exist` (no match) | 0 | 2.36 s | 16 ms | 145× |
 
-The index is 126 MiB (trigrams too common to narrow anything are stored as
-counts only, which cuts ~20% with zero effect on results).
-A from-scratch build takes about 10 seconds with a warm filesystem cache
+The index is 129 MiB — mid-frequency trigrams are bitmap-encoded and
+near-universal ones stored as counts only, ~20% smaller than plain varint
+postings with zero effect on results.
+A from-scratch build takes about 9 seconds with a warm filesystem cache
 (cold-cache builds are I/O-bound and vary with the disk).
 
-An unchanged `grix index` takes about 0.35 seconds — a parallel directory
+An unchanged `grix index` takes about 0.3 seconds — a parallel directory
 walk and nothing else; nothing is written. Changing one file costs about
-0.5 seconds: the change goes into a small sidecar overlay and the main
-index is left alone.
+the same: the change goes into a small sidecar overlay and the main index
+is left alone.
 
 There are Linux numbers too.
 These are from a stock GitHub Actions runner with 4 cores, measured on

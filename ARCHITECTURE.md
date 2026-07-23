@@ -112,14 +112,16 @@ touched. Little-endian, mmap-friendly (format `GRIXIDX3`):
   own section, so a query only ever touches its candidates' metadata — no
   per-search walk over the whole file table.
 - **trigram table**: sorted fixed-width entries; a posting list is found by
-  binary search and decoded lazily. A trigram that occurred in more than a
-  quarter of all files is stored **dense**: its id list narrows nothing, so
-  only its document frequency is kept and a query treats it as "matches
-  everything" — strictly weakening the index constraint, never dropping
-  results. This alone shrinks the index by ~20%.
-- **postings**: per-trigram sorted file ids, delta + LEB128 encoded.
-  The linux kernel source (92,823 files, ~1.4 GB) indexes to ~126 MiB with
-  this scheme.
+  binary search and decoded lazily. Each list gets the cheapest of three
+  encodings: delta + LEB128 varints for rare trigrams; a file-count-wide
+  **bitmap** once more than 1/8 of all files contain the trigram (smaller
+  than varints from there on, and byte-for-byte the same information — no
+  narrowing power lost); and **dense** (document count only) once more
+  than 3/4 contain it — a list covering nearly everything narrows nothing,
+  so dropping its ids strictly weakens the constraint and can never drop
+  results. Together this is ~20% smaller than varints alone.
+- **postings**: per-trigram sorted file ids in the encodings above.
+  The linux kernel source (92,823 files, ~1.4 GB) indexes to ~129 MiB.
 
 The same format serves a second role: a small sidecar **overlay**
 (`.gixo`) holding only what changed since the base was built, plus the

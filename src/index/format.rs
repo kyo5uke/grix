@@ -47,13 +47,29 @@ const HEADER_LEN: usize = 160;
 
 /// Sentinel in a trigram-table `len` field: dense trigram, no stored ids.
 pub const DENSE_LEN: u32 = u32::MAX;
+/// Sentinel in a trigram-table `len` field: ids stored as a file-count-wide
+/// bitmap (its byte length is implied by the header's file count).
+pub const BITMAP_LEN: u32 = u32::MAX - 1;
+
+/// Above this document frequency a list is stored as a bitmap: with ~1 byte
+/// per id in the delta-varint form, a fixed `file_count/8`-byte bitmap is
+/// smaller once more than 1/8 of all files contain the trigram — and it
+/// keeps every id, so unlike `dense` it costs zero narrowing power. The
+/// floor keeps tiny indexes on the simpler varint path.
+fn bitmap_threshold(file_count: usize) -> usize {
+    (file_count / 8).max(16)
+}
 
 /// Document-frequency threshold above which a posting list is stored dense.
 /// Lists this long cover so much of the tree that intersecting them barely
 /// narrows candidates; dropping them shrinks the index and every future
-/// decode of it.
+/// decode of it. Tuned on the kernel corpus: at 1/4 the cut reached
+/// mid-frequency trigrams that still carry real AND-narrowing power
+/// (`int` 75%, `_pr` 34% — regex queries slowed ~18%); at 3/4 only the
+/// true junk head (whitespace runs etc.) goes dense and query times are
+/// unchanged.
 pub fn dense_threshold(file_count: usize) -> usize {
-    (file_count / 4).max(1024)
+    (file_count * 3 / 4).max(1024)
 }
 
 /// Leftover temps from a crashed build are collected once they are this old.
@@ -293,6 +309,8 @@ fn write_index_streamed(
     // length up front. The blob goes to a temp file; only the fixed 16-byte
     // table entries are kept in memory.
     let dense_at = dense_threshold(files.len());
+    let bitmap_at = bitmap_threshold(files.len());
+    let bitmap_bytes = files.len().div_ceil(8);
     let mut tri_table: Vec<u8> = Vec::new();
     let mut post_len: u64 = 0;
     {
@@ -319,15 +337,27 @@ fn write_index_streamed(
             }
             let PostList::Ids(ids) = list else { unreachable!() };
             buf.clear();
-            let mut prev = 0u32;
-            for (i, &id) in ids.iter().enumerate() {
-                let delta = if i == 0 { id } else { id - prev };
-                varint::write_u64(&mut buf, u64::from(delta));
-                prev = id;
+            if ids.len() > bitmap_at {
+                // Mid-frequency list: a fixed-width bitmap beats varint and
+                // keeps every id (full narrowing power, unlike dense).
+                buf.resize(bitmap_bytes, 0);
+                for &id in ids {
+                    buf[(id / 8) as usize] |= 1 << (id % 8);
+                }
+                tri_table.extend_from_slice(&key.to_le_bytes());
+                tri_table.extend_from_slice(&BITMAP_LEN.to_le_bytes());
+                tri_table.extend_from_slice(&post_len.to_le_bytes());
+            } else {
+                let mut prev = 0u32;
+                for (i, &id) in ids.iter().enumerate() {
+                    let delta = if i == 0 { id } else { id - prev };
+                    varint::write_u64(&mut buf, u64::from(delta));
+                    prev = id;
+                }
+                tri_table.extend_from_slice(&key.to_le_bytes());
+                tri_table.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+                tri_table.extend_from_slice(&post_len.to_le_bytes());
             }
-            tri_table.extend_from_slice(&key.to_le_bytes());
-            tri_table.extend_from_slice(&(buf.len() as u32).to_le_bytes());
-            tri_table.extend_from_slice(&post_len.to_le_bytes());
             pw.write_all(&buf)?;
             post_len += buf.len() as u64;
         }
@@ -650,6 +680,29 @@ impl IndexReader {
             // Dense entry: `off` carries the document frequency.
             return Ok(Postings::Dense(off));
         }
+        if len == BITMAP_LEN {
+            // Bitmap entry: file-count-wide, byte length implied.
+            let bytes = posting_bytes(
+                self.buf(),
+                self.postings_off,
+                off as usize,
+                self.file_count.div_ceil(8),
+            )?;
+            let mut ids = Vec::new();
+            for (byte_i, &b) in bytes.iter().enumerate() {
+                let mut bits = b;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    let id = byte_i * 8 + bit as usize;
+                    if id >= self.file_count {
+                        return Err(IndexError::Corrupt("bitmap id out of range"));
+                    }
+                    ids.push(id as u32);
+                    bits &= bits - 1;
+                }
+            }
+            return Ok(Postings::Ids(ids));
+        }
         let bytes = posting_bytes(self.buf(), self.postings_off, off as usize, len as usize)?;
         Ok(Postings::Ids(decode_postings(bytes, self.file_count)?))
     }
@@ -791,7 +844,7 @@ mod tests {
     fn dense_lists_store_df_only() {
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("d.gix");
-        // Enough files that the dense threshold (max(1024, n/4)) is real.
+        // Enough files that the dense threshold (max(1024, 3n/4)) is real.
         let files: Vec<FileRecord> = (0..2000)
             .map(|i| FileRecord {
                 rel_path: format!("f{i:04}.txt"),
@@ -800,10 +853,12 @@ mod tests {
                 flags: 0,
             })
             .collect();
-        let common: Vec<u32> = (0..1500).collect(); // > threshold -> dense
+        let common: Vec<u32> = (0..1800).collect(); // > 3n/4 -> dense
+        let mid: Vec<u32> = (0..600).map(|i| i * 3).collect(); // > n/8 -> bitmap
         let rare: Vec<u32> = vec![5, 900];
         let postings = vec![
             (crate::trigram::pack_str(b"aaa"), common),
+            (crate::trigram::pack_str(b"mmm"), mid.clone()),
             (crate::trigram::pack_str(b"rrr"), rare.clone()),
         ];
         write_index(
@@ -819,7 +874,12 @@ mod tests {
         let r = IndexReader::open(&idx).unwrap();
         assert_eq!(
             r.postings(crate::trigram::pack_str(b"aaa")).unwrap(),
-            Postings::Dense(1500)
+            Postings::Dense(1800)
+        );
+        // Bitmap encoding is transparent: same ids come back out.
+        assert_eq!(
+            r.postings(crate::trigram::pack_str(b"mmm")).unwrap(),
+            Postings::Ids(mid)
         );
         assert_eq!(
             r.postings(crate::trigram::pack_str(b"rrr")).unwrap(),
@@ -829,7 +889,7 @@ mod tests {
         let mut seen_dense = false;
         for item in r.iter_postings() {
             if let (_, Postings::Dense(df)) = item.unwrap() {
-                assert_eq!(df, 1500);
+                assert_eq!(df, 1800);
                 seen_dense = true;
             }
         }
