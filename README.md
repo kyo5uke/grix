@@ -106,16 +106,16 @@ search costs when the tree hasn't changed.
 
 | pattern | matched lines | ripgrep | grix | speedup |
 | --- | ---: | ---: | ---: | ---: |
-| `PageTransHuge` (rare literal) | 5 | 2.78 s | 15 ms | 181× |
-| `EXPORT_SYMBOL` (common literal) | 38,267 | 2.41 s | 174 ms | 13.9× |
-| `static\s+int\s+\w+_probe` (regex) | 10,081 | 2.40 s | 301 ms | 8.0× |
-| `spinlock` (`-i`) | 17,086 | 2.41 s | 217 ms | 11.1× |
-| `zzqqxx_does_not_exist` (no match) | 0 | 2.36 s | 16 ms | 145× |
+| `PageTransHuge` (rare literal) | 5 | 2.31 s | 14 ms | 168× |
+| `EXPORT_SYMBOL` (common literal) | 38,267 | 2.30 s | 174 ms | 13.2× |
+| `static\s+int\s+\w+_probe` (regex) | 10,081 | 2.95 s | 339 ms | 8.7× |
+| `spinlock` (`-i`) | 17,086 | 2.43 s | 217 ms | 11.2× |
+| `zzqqxx_does_not_exist` (no match) | 0 | 2.30 s | 15 ms | 153× |
 
 The index is 129 MiB — mid-frequency trigrams are bitmap-encoded and
 near-universal ones stored as counts only, ~20% smaller than plain varint
 postings with zero effect on results.
-A from-scratch build takes about 9 seconds with a warm filesystem cache
+A from-scratch build takes about 7 seconds with a warm filesystem cache
 (cold-cache builds are I/O-bound and vary with the disk).
 
 An unchanged `grix index` takes about 0.3 seconds — a parallel directory
