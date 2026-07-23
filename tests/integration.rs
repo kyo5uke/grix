@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use grix::index::build::{self, BuildOptions};
-use grix::index::format::IndexReader;
+use grix::index::format::{overlay_path, IndexReader};
 use grix::search::{self, SearchOptions};
 
 struct Fixture {
@@ -81,9 +81,23 @@ fn opts_small_cap() -> BuildOptions {
     }
 }
 
-fn build_fixture_index(fx: &Fixture) -> IndexReader {
-    build::build(&fx.root, &fx.index_path, None, &opts_small_cap()).unwrap();
-    IndexReader::open(&fx.index_path).unwrap()
+fn build_fixture_index(fx: &Fixture) {
+    build::build(&fx.root, &fx.index_path, &opts_small_cap()).unwrap();
+}
+
+/// Search through base + (if present) overlay, exactly like the CLI does.
+fn search_all(
+    fx: &Fixture,
+    pattern: &str,
+    opts: &SearchOptions,
+) -> (Vec<grix::search::FileResult>, grix::search::SearchStats) {
+    let matcher = search::compile(pattern, opts).unwrap();
+    let base = IndexReader::open(&fx.index_path).unwrap();
+    let over = IndexReader::open(&overlay_path(&fx.index_path))
+        .ok()
+        .filter(|o| o.index_ids().parent_id == base.index_ids().build_id);
+    let view = search::View::new(&base, over.as_ref());
+    search::search_index(&view, &fx.root, &matcher, opts).unwrap()
 }
 
 fn result_set(results: &[grix::search::FileResult]) -> BTreeSet<(String, u64)> {
@@ -99,7 +113,7 @@ fn result_set(results: &[grix::search::FileResult]) -> BTreeSet<(String, u64)> {
 #[test]
 fn index_search_equals_full_scan() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let patterns: &[(&str, bool)] = &[
         ("foo", false),
         ("foo", true),
@@ -126,7 +140,7 @@ fn index_search_equals_full_scan() {
             ..Default::default()
         };
         let matcher = search::compile(pattern, &opts).unwrap();
-        let (with_index, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+        let (with_index, _) = search_all(&fx, pattern, &opts);
         let (walked, _) = search::search_walk(&fx.root, &matcher, &opts).unwrap();
         assert_eq!(
             result_set(&with_index),
@@ -139,10 +153,9 @@ fn index_search_equals_full_scan() {
 #[test]
 fn finds_expected_lines() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let opts = SearchOptions::default();
-    let matcher = search::compile("foo", &opts).unwrap();
-    let (results, stats) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    let (results, stats) = search_all(&fx, "foo", &opts);
     let set = result_set(&results);
 
     assert!(set.contains(&("src/lib.rs".into(), 1)));
@@ -164,8 +177,9 @@ fn finds_expected_lines() {
 #[test]
 fn incremental_update_reflects_edits() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let opts = SearchOptions::default();
+    let base_mtime = std::fs::metadata(&fx.index_path).unwrap().modified().unwrap();
 
     // New file + modified file + deleted file.
     write(
@@ -182,29 +196,32 @@ fn incremental_update_reflects_edits() {
     );
     std::fs::remove_file(fx.root.join("docs/guide.md")).unwrap();
 
-    let old = reader;
-    let stats = build::build(&fx.root, &fx.index_path, Some(&old), &opts_small_cap()).unwrap();
+    let stats = build::build(&fx.root, &fx.index_path, &opts_small_cap()).unwrap();
     assert!(
         stats.files_reused > 0,
         "expected unchanged files to be reused, got {stats:?}"
     );
-    let reader = IndexReader::open(&fx.index_path).unwrap();
+    // The refresh went to the overlay; the base was not rewritten.
+    assert!(overlay_path(&fx.index_path).exists());
+    assert_eq!(
+        std::fs::metadata(&fx.index_path).unwrap().modified().unwrap(),
+        base_mtime,
+        "small refresh must not rewrite the base index"
+    );
 
-    let matcher = search::compile("SENTINEL_XYZQ", &opts).unwrap();
-    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    let (results, _) = search_all(&fx, "SENTINEL_XYZQ", &opts);
     let set = result_set(&results);
     assert!(set.contains(&("src/new_module.rs".into(), 1)));
     assert!(set.contains(&("src/lib.rs".into(), 2)));
 
-    // Deleted file is gone from results.
-    let matcher = search::compile("Searching with", &opts).unwrap();
-    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    // Deleted file is gone from results (tombstoned in the overlay).
+    let (results, _) = search_all(&fx, "Searching with", &opts);
     assert!(results.is_empty());
 
-    // And the equivalence property still holds after the incremental build.
+    // And the equivalence property still holds through the overlay.
     for pattern in ["foo", "SENTINEL_XYZQ", "fn "] {
         let matcher = search::compile(pattern, &opts).unwrap();
-        let (a, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+        let (a, _) = search_all(&fx, pattern, &opts);
         let (b, _) = search::search_walk(&fx.root, &matcher, &opts).unwrap();
         assert_eq!(result_set(&a), result_set(&b), "diverged for {pattern:?}");
     }
@@ -213,13 +230,12 @@ fn incremental_update_reflects_edits() {
 #[test]
 fn path_scope_dir_filters() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let opts = SearchOptions {
         path_scopes: vec!["src".into()],
         ..Default::default()
     };
-    let matcher = search::compile("foo", &opts).unwrap();
-    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    let (results, _) = search_all(&fx, "foo", &opts);
     assert!(!results.is_empty());
     assert!(results.iter().all(|r| r.rel_path.starts_with("src/")));
 }
@@ -227,13 +243,12 @@ fn path_scope_dir_filters() {
 #[test]
 fn path_scope_single_file() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let opts = SearchOptions {
         path_scopes: vec!["src/lib.rs".into()],
         ..Default::default()
     };
-    let matcher = search::compile("foo", &opts).unwrap();
-    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    let (results, _) = search_all(&fx, "foo", &opts);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].rel_path, "src/lib.rs");
 }
@@ -241,13 +256,12 @@ fn path_scope_single_file() {
 #[test]
 fn path_scope_multiple() {
     let fx = fixture();
-    let reader = build_fixture_index(&fx);
+    build_fixture_index(&fx);
     let opts = SearchOptions {
         path_scopes: vec!["src".into(), "docs/guide.md".into()],
         ..Default::default()
     };
-    let matcher = search::compile("foo", &opts).unwrap();
-    let (results, _) = search::search_index(&reader, &fx.root, &matcher, &opts).unwrap();
+    let (results, _) = search_all(&fx, "foo", &opts);
     assert!(results.iter().any(|r| r.rel_path.starts_with("src/")));
     assert!(results.iter().any(|r| r.rel_path == "docs/guide.md"));
     assert!(results
@@ -270,7 +284,8 @@ fn binary_smoke_exit_codes() {
             .unwrap()
     };
 
-    // First search auto-indexes and finds matches -> exit 0.
+    // First search answers immediately from a full scan (the index builds
+    // in a detached child) -> exit 0 with the same results.
     let out = run(&["foo", ".", "--color", "never"]);
     assert_eq!(
         out.status.code(),
@@ -283,6 +298,23 @@ fn binary_smoke_exit_codes() {
         stdout.contains("hello grix") || stdout.contains("foo"),
         "{stdout}"
     );
+
+    // Wait for the background builder to land the index and release the
+    // marker, so the remaining steps are deterministic. `watch: off` is
+    // printed only once the index opens and no heartbeat is fresh.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let st = run(&["status"]);
+        let text = String::from_utf8_lossy(&st.stdout).into_owned();
+        if text.contains("files:") && text.contains("watch:    off") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background index build did not finish: {text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     // No match -> exit 1.
     let out = run(&["qqqqqq_nothing", ".", "--color", "never"]);

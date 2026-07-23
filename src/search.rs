@@ -10,9 +10,127 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::index::format::{IndexReader, FLAG_BINARY, FLAG_SCAN_ALWAYS};
+use crate::index::format::{FileMeta, IndexError, IndexReader, Postings, FLAG_BINARY, FLAG_SCAN_ALWAYS};
 use crate::plan::{self, Query};
 use crate::trigram;
+
+/// Search-time composition of a base index and its (optional) overlay:
+/// base ids stay `[0, B)`, overlay ids live at `[B, B+O)`, and base ids the
+/// overlay superseded (tombstones) are dead. All the merge logic lives
+/// here; the readers stay dumb mmaps.
+pub struct View<'a> {
+    base: &'a IndexReader,
+    overlay: Option<&'a IndexReader>,
+    /// Bitset over base ids: superseded by the overlay.
+    dead: Vec<u64>,
+    alive_base: usize,
+}
+
+/// A candidate id set during query evaluation. `All` (every alive file)
+/// propagates lazily so dense trigrams and `.*`-ish queries never
+/// materialize 90k-element vectors mid-expression.
+enum IdSet {
+    All,
+    Ids(Vec<u32>),
+}
+
+impl<'a> View<'a> {
+    pub fn new(base: &'a IndexReader, overlay: Option<&'a IndexReader>) -> Self {
+        // Callers validate the pairing; be defensive anyway.
+        let overlay =
+            overlay.filter(|o| o.index_ids().parent_id == base.index_ids().build_id);
+        let mut dead = vec![0u64; base.file_count().div_ceil(64)];
+        let mut dead_count = 0usize;
+        if let Some(o) = overlay {
+            for id in o.tombstones() {
+                let id = id as usize;
+                if id < base.file_count() {
+                    let (w, m) = (id / 64, 1u64 << (id % 64));
+                    if dead[w] & m == 0 {
+                        dead[w] |= m;
+                        dead_count += 1;
+                    }
+                }
+            }
+        }
+        View {
+            base,
+            overlay,
+            dead,
+            alive_base: base.file_count() - dead_count,
+        }
+    }
+
+    #[inline]
+    fn base_count(&self) -> u32 {
+        self.base.file_count() as u32
+    }
+
+    #[inline]
+    fn is_dead(&self, base_id: u32) -> bool {
+        self.dead[(base_id / 64) as usize] & (1u64 << (base_id % 64)) != 0
+    }
+
+    /// Alive files across base and overlay.
+    pub fn file_count(&self) -> usize {
+        self.alive_base + self.overlay.map_or(0, |o| o.file_count())
+    }
+
+    pub fn file(&self, id: u32) -> Result<FileMeta<'_>, IndexError> {
+        let b = self.base_count();
+        if id < b {
+            self.base.file(id)
+        } else {
+            self.overlay
+                .ok_or(IndexError::Corrupt("overlay id without overlay"))?
+                .file(id - b)
+        }
+    }
+
+    /// Candidate ids for one trigram, in ascending order (base then
+    /// offset overlay ids — already sorted by construction).
+    fn postings(&self, t: u32) -> Result<IdSet, IndexError> {
+        let base_ids = match self.base.postings(t)? {
+            Postings::Dense(_) => return Ok(IdSet::All),
+            Postings::Ids(v) => v,
+        };
+        let mut ids: Vec<u32> = base_ids.into_iter().filter(|&i| !self.is_dead(i)).collect();
+        if let Some(o) = self.overlay {
+            match o.postings(t)? {
+                Postings::Dense(_) => return Ok(IdSet::All),
+                Postings::Ids(ov) => {
+                    let off = self.base_count();
+                    ids.extend(ov.into_iter().map(|i| i + off));
+                }
+            }
+        }
+        Ok(IdSet::Ids(ids))
+    }
+
+    /// Every alive id (the top-level `ALL` materialization).
+    fn all_ids(&self) -> Vec<u32> {
+        let b = self.base_count();
+        let mut v: Vec<u32> = (0..b).filter(|&i| !self.is_dead(i)).collect();
+        if let Some(o) = self.overlay {
+            v.extend((0..o.file_count() as u32).map(|i| i + b));
+        }
+        v
+    }
+
+    /// Alive scan-always ids across base and overlay.
+    fn scan_always(&self) -> Vec<u32> {
+        let b = self.base_count();
+        let mut v: Vec<u32> = self
+            .base
+            .scan_always_ids()
+            .filter(|&i| !self.is_dead(i))
+            .collect();
+        if let Some(o) = self.overlay {
+            v.extend(o.scan_always_ids().map(|i| i + b));
+        }
+        v
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -246,17 +364,25 @@ fn union(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
     out
 }
 
-/// Evaluate the trigram query into a sorted candidate id list.
-fn eval(q: &Query, r: &IndexReader) -> Result<Vec<u32>, SearchError> {
+/// Evaluate the trigram query into a candidate id set. `All` propagates
+/// lazily: a dense trigram is a constraint that constrains nothing, so in
+/// an AND it simply drops out and in an OR it absorbs the whole branch.
+fn eval(q: &Query, v: &View) -> Result<IdSet, SearchError> {
     Ok(match q {
-        Query::None => Vec::new(),
-        Query::All => (0..r.file_count() as u32).collect(),
-        Query::Tri(t) => r.postings(*t).map_err(SearchError::Index)?,
+        Query::None => IdSet::Ids(Vec::new()),
+        Query::All => IdSet::All,
+        Query::Tri(t) => v.postings(*t).map_err(SearchError::Index)?,
         Query::And(subs) => {
             // Cheapest lists first: evaluate all, sort by length, intersect.
             let mut lists = Vec::with_capacity(subs.len());
             for s in subs {
-                lists.push(eval(s, r)?);
+                match eval(s, v)? {
+                    IdSet::All => {} // X ∧ ALL = X
+                    IdSet::Ids(l) => lists.push(l),
+                }
+            }
+            if lists.is_empty() {
+                return Ok(IdSet::All);
             }
             lists.sort_by_key(|l| l.len());
             let mut it = lists.into_iter();
@@ -267,14 +393,17 @@ fn eval(q: &Query, r: &IndexReader) -> Result<Vec<u32>, SearchError> {
                 }
                 acc = intersect(acc, l);
             }
-            acc
+            IdSet::Ids(acc)
         }
         Query::Or(subs) => {
             let mut acc = Vec::new();
             for s in subs {
-                acc = union(acc, eval(s, r)?);
+                match eval(s, v)? {
+                    IdSet::All => return Ok(IdSet::All), // X ∨ ALL = ALL
+                    IdSet::Ids(l) => acc = union(acc, l),
+                }
             }
-            acc
+            IdSet::Ids(acc)
         }
     })
 }
@@ -511,23 +640,27 @@ fn scan_targets(
     (results, scanned.load(Ordering::Relaxed))
 }
 
-/// Search using an index. Returns per-file results sorted by path.
+/// Search using an index view (base + optional overlay). Returns per-file
+/// results sorted by path.
 pub fn search_index(
-    reader: &IndexReader,
+    view: &View,
     root: &Path,
     matcher: &Matcher,
     opts: &SearchOptions,
 ) -> Result<(Vec<FileResult>, SearchStats), SearchError> {
     let mut stats = SearchStats {
         query_display: matcher.query.display(),
-        files_in_index: reader.file_count(),
+        files_in_index: view.file_count(),
         ..Default::default()
     };
 
     let filter = FileFilter::build(opts)?;
 
     let t0 = Instant::now();
-    let ids = eval(&matcher.query, reader)?;
+    let ids = match eval(&matcher.query, view)? {
+        IdSet::Ids(ids) => ids,
+        IdSet::All => view.all_ids(),
+    };
     stats.lookup_micros = t0.elapsed().as_micros();
 
     // Candidates = query hits + always-scan files − binary, path/glob/type-filtered.
@@ -536,7 +669,7 @@ pub fn search_index(
     let mut targets: Vec<(u32, String, u64)> = Vec::with_capacity(ids.len());
     {
         let mut push_target = |id: u32, skip_scan_always: bool| -> Result<(), SearchError> {
-            let meta = reader.file(id).map_err(SearchError::Index)?;
+            let meta = view.file(id).map_err(SearchError::Index)?;
             if meta.flags & FLAG_BINARY != 0 {
                 return Ok(());
             }
@@ -552,7 +685,7 @@ pub fn search_index(
         for &id in ids.iter() {
             push_target(id, true)?;
         }
-        for id in reader.scan_always_ids() {
+        for id in view.scan_always() {
             push_target(id, false)?;
         }
     }

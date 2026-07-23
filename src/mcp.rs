@@ -233,15 +233,20 @@ fn do_search(
     // here so results never stay pinned to the moment the watcher stopped.
     // An unchanged tree makes this a walk + stat, not a rebuild.
     if !store::watcher_is_live(idx) {
-        let old = IndexReader::open(idx).ok();
-        if let Err(e) = build::build(root, idx, old.as_ref(), &BuildOptions::default()) {
+        if let Err(e) = build::build(root, idx, &BuildOptions::default()) {
             eprintln!("grix mcp: index refresh skipped ({e})");
         }
     }
     match IndexReader::open(idx) {
-        Ok(reader) => search::search_index(&reader, root, matcher, opts)
-            .map(|(r, _)| r)
-            .map_err(|e| e.to_string()),
+        Ok(reader) => {
+            let overlay = IndexReader::open(&crate::index::format::overlay_path(idx))
+                .ok()
+                .filter(|o| o.index_ids().parent_id == reader.index_ids().build_id);
+            let view = search::View::new(&reader, overlay.as_ref());
+            search::search_index(&view, root, matcher, opts)
+                .map(|(r, _)| r)
+                .map_err(|e| e.to_string())
+        }
         Err(_) => search::search_walk(root, matcher, opts)
             .map(|(r, _)| r)
             .map_err(|e| e.to_string()),

@@ -55,7 +55,9 @@ Prebuilt binaries (including Windows) are also on the [Releases](https://github.
 
 ```bash
 cd your-repo
-grix 'fn main'            # first run builds the index; every run refreshes it
+grix 'fn main'            # first run answers via a full scan while the
+                          # index builds in the background; later runs
+                          # refresh + use the index
 grix 'fn main' src/       # limit the search to a directory or file
 grix -C2 'fn main'        # show 2 lines of context around each match
 grix -t rust 'fn main'    # filter by file type (or -g '*.rs')
@@ -63,9 +65,10 @@ grix --no-auto-index 'fn main'  # use the index as-is, no refresh (fastest, may 
 ```
 
 By default each search refreshes the index first, so results are always up to
-date. Unchanged files are not re-read (matched by size and mtime), so a refresh
-is mostly just a directory walk. For the fastest path that uses the existing
-index as-is, pass `--no-auto-index`.
+date. Unchanged files are not re-read (matched by size and mtime), and changes
+land in a small sidecar overlay instead of rewriting the index, so a refresh
+costs a directory walk plus whatever actually changed. For the fastest path
+that uses the existing index as-is, pass `--no-auto-index`.
 
 ### Watch mode — instant *and* always fresh
 
@@ -109,13 +112,15 @@ search costs when the tree hasn't changed.
 | `spinlock` (`-i`) | 17,086 | 2.41 s | 217 ms | 11.1× |
 | `zzqqxx_does_not_exist` (no match) | 0 | 2.36 s | 16 ms | 145× |
 
-The index is 162 MiB.
+The index is 126 MiB (trigrams too common to narrow anything are stored as
+counts only, which cuts ~20% with zero effect on results).
 A from-scratch build takes about 10 seconds with a warm filesystem cache
 (cold-cache builds are I/O-bound and vary with the disk).
 
 An unchanged `grix index` takes about 0.35 seconds — a parallel directory
-walk and nothing else. It re-reads no file contents and does not rewrite
-the index file.
+walk and nothing else; nothing is written. Changing one file costs about
+0.5 seconds: the change goes into a small sidecar overlay and the main
+index is left alone.
 
 There are Linux numbers too.
 These are from a stock GitHub Actions runner with 4 cores, measured on

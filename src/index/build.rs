@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::UNIX_EPOCH;
 
-use super::format::{self, FileRecord, IndexReader, PostingsSource, FLAG_BINARY, FLAG_SCAN_ALWAYS};
+use super::format::{
+    self, FileRecord, IndexReader, PostList, PostingsSource, FLAG_BINARY, FLAG_SCAN_ALWAYS,
+};
 use crate::trigram::{self, TriSet};
 
 #[derive(Debug, Clone)]
@@ -184,115 +186,236 @@ fn extract_pairs(data: &[u8], id: u32, tri: &mut TriSet, out: &mut Vec<u64>) {
     tri.clear();
 }
 
-/// Build (or incrementally rebuild) the index for `root` into `index_path`.
-pub fn build(
-    root: &Path,
-    index_path: &Path,
-    old: Option<&IndexReader>,
-    opts: &BuildOptions,
-) -> io::Result<BuildStats> {
-    match build_inner(root, index_path, old, opts) {
-        // A corrupt old index surfaces as InvalidData while its postings
-        // stream through the merge; retry once from scratch (the same
-        // recovery semantics as an upfront validation, without paying a
-        // full decode on every healthy build).
-        Err(e) if old.is_some() && e.kind() == io::ErrorKind::InvalidData => {
-            build_inner(root, index_path, None, opts)
+/// Where a candidate's current contents already live, if anywhere.
+enum Class {
+    /// Unchanged since the base was built: base id.
+    Base(u32),
+    /// Unchanged since the old overlay was written: old overlay id.
+    Over(u32),
+    /// New or changed: must be read.
+    New,
+}
+
+fn new_build_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // Never 0: 0 means "is a base" in parent_id.
+    (t ^ (u64::from(std::process::id()) << 32) ^ SEQ.fetch_add(1, Ordering::Relaxed)) | 1
+}
+
+/// Build or refresh the index for `root`.
+///
+/// With a usable base index, changes accumulate in a small overlay next to
+/// it — the refresh cost tracks the churn since the base was built, not the
+/// tree size. Past a threshold (or without a base) everything is folded
+/// into a fresh base and the overlay is dropped.
+pub fn build(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<BuildStats> {
+    match build_attempt(root, index_path, opts, true) {
+        // A corrupt existing index surfaces as InvalidData while its
+        // postings stream through the merge; retry once from scratch.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            build_attempt(root, index_path, opts, false)
         }
         r => r,
     }
 }
 
-fn build_inner(
+fn build_attempt(
     root: &Path,
     index_path: &Path,
-    old: Option<&IndexReader>,
     opts: &BuildOptions,
+    use_existing: bool,
 ) -> io::Result<BuildStats> {
     let mut stats = BuildStats::default();
+    let overlay_path = format::overlay_path(index_path);
     // Reclaim temps a crashed build may have left next to the index (their
     // names are unique per attempt, so nothing else ever overwrites them).
     format::sweep_stale_temps(index_path);
+    format::sweep_stale_temps(&overlay_path);
     let candidates = collect_candidates(root, opts.threads)?;
     stats.files_total = candidates.len();
 
-    // Map old files by path for change detection.
-    let mut old_by_path: HashMap<&str, (u32, u64, u64, u32)> = HashMap::new();
-    if let Some(old) = old {
-        for id in 0..old.file_count() as u32 {
-            if let Ok(m) = old.file(id) {
-                old_by_path.insert(m.rel_path, (id, m.size, m.mtime, m.flags));
+    let base = if use_existing {
+        IndexReader::open(index_path).ok()
+    } else {
+        None
+    };
+    // An overlay only counts if it belongs to this exact base.
+    let old_over = base.as_ref().and_then(|b| {
+        IndexReader::open(&overlay_path)
+            .ok()
+            .filter(|o| o.index_ids().parent_id == b.index_ids().build_id)
+    });
+
+    // Prior state by path, newest representation wins at classification.
+    let mut base_by_path: HashMap<&str, (u32, u64, u64, u32)> = HashMap::new();
+    if let Some(b) = &base {
+        for id in 0..b.file_count() as u32 {
+            if let Ok(m) = b.file(id) {
+                base_by_path.insert(m.rel_path, (id, m.size, m.mtime, m.flags));
+            }
+        }
+    }
+    let mut over_by_path: HashMap<&str, (u32, u64, u64, u32)> = HashMap::new();
+    if let Some(o) = &old_over {
+        for id in 0..o.file_count() as u32 {
+            if let Ok(m) = o.file(id) {
+                over_by_path.insert(m.rel_path, (id, m.size, m.mtime, m.flags));
             }
         }
     }
 
-    // Final file records (ids = position) + work classification.
-    let mut records: Vec<FileRecord> = Vec::with_capacity(candidates.len());
-    // old id -> new id (u32::MAX = dropped / re-extracted)
-    let mut remap: Vec<u32> = vec![u32::MAX; old.map_or(0, |o| o.file_count())];
-    // (new_id, rel_path, size) pending extraction
-    let mut to_extract: Vec<(u32, String, u64)> = Vec::new();
-
+    // Classification: where does each candidate's content already live?
+    let b_count = base.as_ref().map_or(0, |b| b.file_count());
+    let mut class: Vec<Class> = Vec::with_capacity(candidates.len());
+    let mut flags: Vec<u32> = Vec::with_capacity(candidates.len());
+    let mut base_alive = vec![false; b_count];
+    let mut over_kept = 0usize;
+    let mut new_files = 0usize;
     for cand in &candidates {
-        let new_id = records.len() as u32;
         let too_large = cand.size > opts.max_file_size;
-        let mut flags = if too_large { FLAG_SCAN_ALWAYS } else { 0 };
-        let mut reuse_from: Option<u32> = None;
-
-        if let Some(&(old_id, osize, omtime, oflags)) = old_by_path.get(cand.rel_path.as_str()) {
-            if osize == cand.size && omtime == cand.mtime {
-                // Unchanged. Keep its classification (indexed/binary/large)
-                // unless the size cap moved it across the boundary.
-                let was_large = oflags & FLAG_SCAN_ALWAYS != 0;
-                if was_large == too_large {
-                    flags = oflags;
-                    reuse_from = Some(old_id);
-                }
+        // Unchanged (size+mtime) entries keep their stored classification
+        // (indexed/binary/large) unless the size cap moved them across the
+        // boundary. Base match is preferred so reverted files migrate back
+        // out of the overlay.
+        if let Some(&(bid, sz, mt, bf)) = base_by_path.get(cand.rel_path.as_str()) {
+            if sz == cand.size && mt == cand.mtime && (bf & FLAG_SCAN_ALWAYS != 0) == too_large {
+                class.push(Class::Base(bid));
+                flags.push(bf);
+                base_alive[bid as usize] = true;
+                continue;
             }
         }
-
-        match reuse_from {
-            Some(old_id) => {
-                stats.files_reused += 1;
-                if flags == 0 {
-                    // postings recovered from the old index below
-                    remap[old_id as usize] = new_id;
-                }
+        if let Some(&(oid, sz, mt, of)) = over_by_path.get(cand.rel_path.as_str()) {
+            if sz == cand.size && mt == cand.mtime && (of & FLAG_SCAN_ALWAYS != 0) == too_large {
+                class.push(Class::Over(oid));
+                flags.push(of);
+                over_kept += 1;
+                continue;
             }
-            None if too_large => {}
-            None => to_extract.push((new_id, cand.rel_path.clone(), cand.size)),
         }
+        class.push(Class::New);
+        flags.push(if too_large { FLAG_SCAN_ALWAYS } else { 0 });
+        new_files += 1;
+    }
+    let base_kept = base_alive.iter().filter(|&&a| a).count();
+    stats.files_reused = base_kept + over_kept;
 
-        records.push(FileRecord {
-            rel_path: cand.rel_path.clone(),
-            size: cand.size,
-            mtime: cand.mtime,
-            flags,
+    // Every base id without a surviving candidate is superseded: deleted,
+    // changed (now represented in the overlay), or reclassified.
+    let tombstones: Vec<u32> = (0..b_count as u32)
+        .filter(|&id| !base_alive[id as usize])
+        .collect();
+
+    // Mode: fold into a fresh base when there is none, or when the overlay
+    // would grow past its budget (searches pay for overlay size on every
+    // query, and the fold amortizes).
+    let over_files = over_kept + new_files;
+    let cap = (b_count / 8).max(64);
+    let full = base.is_none() || over_files > cap || tombstones.len() > cap;
+
+    if !full {
+        let same_tomb = match &old_over {
+            Some(o) => o.tombstones().eq(tombstones.iter().copied()),
+            None => tombstones.is_empty(),
+        };
+        let kept_all_over = old_over.as_ref().map_or(over_kept == 0, |o| {
+            over_kept == o.file_count()
         });
+        if new_files == 0 && kept_all_over && same_tomb {
+            // Nothing changed relative to base+overlay: write nothing.
+            fill_flag_stats(&mut stats, &flags);
+            return Ok(stats);
+        }
+        if over_files == 0 && tombstones.is_empty() {
+            // Everything reverted to the base: the overlay is obsolete.
+            let _ = std::fs::remove_file(&overlay_path);
+            fill_flag_stats(&mut stats, &flags);
+            return Ok(stats);
+        }
     }
 
-    // Unchanged tree: every file reused, nothing added or removed. Reused
-    // records copy the old flags/size/mtime and ids keep their order, so the
-    // index we would write is byte-identical to the one on disk — skip the
-    // postings decode/remap/re-encode and the rewrite entirely.
-    if old.is_some_and(|o| {
-        to_extract.is_empty()
-            && stats.files_reused == candidates.len()
-            && o.file_count() == candidates.len()
-    }) {
-        fill_flag_stats(&mut stats, &records);
-        return Ok(stats);
+    // Materialize the write set for the chosen mode. `rec2cand` maps record
+    // ids back to candidate indexes so late binary discoveries update the
+    // stats flags too.
+    let mut records: Vec<FileRecord> = Vec::new();
+    let mut rec2cand: Vec<usize> = Vec::new();
+    let mut to_extract: Vec<(u32, String, u64)> = Vec::new();
+    let mut remap_base: Vec<u32> = Vec::new();
+    let mut remap_over: Vec<u32> = vec![u32::MAX; old_over.as_ref().map_or(0, |o| o.file_count())];
+    let (target_path, tombs_out, out_ids);
+    if full {
+        remap_base = vec![u32::MAX; b_count];
+        for (i, cand) in candidates.iter().enumerate() {
+            let id = records.len() as u32;
+            match class[i] {
+                Class::Base(bid) => {
+                    if flags[i] == 0 {
+                        remap_base[bid as usize] = id;
+                    }
+                }
+                Class::Over(oid) => {
+                    if flags[i] == 0 {
+                        remap_over[oid as usize] = id;
+                    }
+                }
+                Class::New => {
+                    if flags[i] & FLAG_SCAN_ALWAYS == 0 {
+                        to_extract.push((id, cand.rel_path.clone(), cand.size));
+                    }
+                }
+            }
+            records.push(FileRecord {
+                rel_path: cand.rel_path.clone(),
+                size: cand.size,
+                mtime: cand.mtime,
+                flags: flags[i],
+            });
+            rec2cand.push(i);
+        }
+        target_path = index_path;
+        tombs_out = Vec::new();
+        out_ids = format::IndexIds::base(new_build_id());
+    } else {
+        for (i, cand) in candidates.iter().enumerate() {
+            match class[i] {
+                Class::Base(_) => continue,
+                Class::Over(oid) => {
+                    if flags[i] == 0 {
+                        remap_over[oid as usize] = records.len() as u32;
+                    }
+                }
+                Class::New => {
+                    if flags[i] & FLAG_SCAN_ALWAYS == 0 {
+                        to_extract.push((records.len() as u32, cand.rel_path.clone(), cand.size));
+                    }
+                }
+            }
+            records.push(FileRecord {
+                rel_path: cand.rel_path.clone(),
+                size: cand.size,
+                mtime: cand.mtime,
+                flags: flags[i],
+            });
+            rec2cand.push(i);
+        }
+        target_path = &overlay_path;
+        tombs_out = tombstones;
+        out_ids = format::IndexIds {
+            build_id: new_build_id(),
+            parent_id: base.as_ref().map_or(0, |b| b.index_ids().build_id),
+        };
     }
-
-    // Corrupt-old-index detection needs the classification to be redone from
-    // scratch (see `build`), so nothing below may mutate `remap`.
-    let remap = remap;
+    stats.files_extracted = to_extract.len();
 
     // Parallel extraction of changed/new files. Workers emit batched pair
     // messages; this thread accumulates them under the spill budget. The
     // bounded channel provides backpressure while a spill is in progress.
-    stats.files_extracted = to_extract.len();
-    let mut acc = PairAcc::new(index_path, opts.spill_budget);
+    let mut acc = PairAcc::new(target_path, opts.spill_budget);
     let next = AtomicUsize::new(0);
     let nthreads = opts.threads.max(1).min(to_extract.len().max(1));
     let (tx, rx) = mpsc::sync_channel::<WorkMsg>(nthreads);
@@ -336,6 +459,7 @@ fn build_inner(
             stats.bytes_read += msg.bytes;
             for id in msg.binaries {
                 records[id as usize].flags = FLAG_BINARY;
+                flags[rec2cand[id as usize]] = FLAG_BINARY;
             }
             if let Err(e) = acc.extend(msg.pairs) {
                 drain_err = Some(e);
@@ -347,31 +471,34 @@ fn build_inner(
         return Err(e);
     }
 
-    fill_flag_stats(&mut stats, &records);
+    fill_flag_stats(&mut stats, &flags);
 
-    // Merge the in-memory run, spilled runs and the old-index run into one
-    // sorted (key, ids) stream. The guard deletes shard files after the
-    // write completes.
-    let old_run = match old {
-        Some(o) => Some(OldRun::new(o, &remap)?),
-        None => None,
-    };
-    let (merged, _guard) = acc.into_source(old_run)?;
+    // Merge the in-memory run, spilled runs and the reused-index runs into
+    // one sorted (key, list) stream. The guard deletes shard files after
+    // the write completes.
+    let mut old_runs: Vec<OldRun> = Vec::new();
+    if full {
+        if let Some(b) = &base {
+            old_runs.push(OldRun::new(b, &remap_base)?);
+        }
+    }
+    if let Some(o) = &old_over {
+        old_runs.push(OldRun::new(o, &remap_over)?);
+    }
+    let (merged, _guard) = acc.into_source(old_runs)?;
     let root_str = root.to_string_lossy().replace('\\', "/");
-    format::write_index(index_path, &root_str, &records, merged)?;
+    format::write_index(target_path, &root_str, &records, merged, &tombs_out, out_ids)?;
+    if full {
+        // Any overlay now describes a dead base.
+        let _ = std::fs::remove_file(&overlay_path);
+    }
     Ok(stats)
 }
 
-fn fill_flag_stats(stats: &mut BuildStats, records: &[FileRecord]) {
-    stats.files_indexed = records.iter().filter(|r| r.flags == 0).count();
-    stats.files_binary = records
-        .iter()
-        .filter(|r| r.flags & FLAG_BINARY != 0)
-        .count();
-    stats.files_scan_always = records
-        .iter()
-        .filter(|r| r.flags & FLAG_SCAN_ALWAYS != 0)
-        .count();
+fn fill_flag_stats(stats: &mut BuildStats, flags: &[u32]) {
+    stats.files_indexed = flags.iter().filter(|&&f| f == 0).count();
+    stats.files_binary = flags.iter().filter(|&&f| f & FLAG_BINARY != 0).count();
+    stats.files_scan_always = flags.iter().filter(|&&f| f & FLAG_SCAN_ALWAYS != 0).count();
 }
 
 /// Bounded pair accumulator. Batches of packed `(trigram << 32) | id` pairs
@@ -430,9 +557,9 @@ impl PairAcc {
         Ok(())
     }
 
-    /// Consume into the merged (key, ids) stream plus a guard that deletes
+    /// Consume into the merged (key, list) stream plus a guard that deletes
     /// the shard files once the stream has been consumed and dropped.
-    fn into_source<'a>(mut self, old: Option<OldRun<'a>>) -> io::Result<(Merged<'a>, ShardGuard)> {
+    fn into_source(mut self, old: Vec<OldRun<'_>>) -> io::Result<(Merged<'_>, ShardGuard)> {
         // The in-memory remainder merges directly; no need to round-trip it
         // through disk.
         self.pairs.sort_unstable();
@@ -499,17 +626,25 @@ impl ShardCursor {
     }
 }
 
-type OldPostings<'a> = Box<dyn Iterator<Item = Result<(u32, Vec<u32>), format::IndexError>> + 'a>;
+type OldPostings<'a> =
+    Box<dyn Iterator<Item = Result<(u32, format::Postings), format::IndexError>> + 'a>;
 
-/// The old index streamed as a pre-sorted run: keys ascending, ids remapped
-/// to new ids (survivors keep their relative order, so lists stay sorted).
-/// Decode errors surface as `InvalidData`, which `build` turns into a
-/// from-scratch rebuild.
+/// One reused group from an existing index.
+enum OldGroup {
+    /// Remapped, non-empty, ascending ids.
+    Ids(Vec<u32>),
+    /// Dense trigram: the ids were never stored; passes through as dense.
+    Dense(u64),
+}
+
+/// An existing index streamed as a pre-sorted run: keys ascending, ids
+/// remapped to new ids (survivors keep their relative order, so lists stay
+/// sorted). Decode errors surface as `InvalidData`, which `build` turns
+/// into a from-scratch rebuild.
 struct OldRun<'a> {
     it: OldPostings<'a>,
     remap: &'a [u32],
-    /// Next remapped, non-empty group.
-    next: Option<(u32, Vec<u32>)>,
+    next: Option<(u32, OldGroup)>,
 }
 
 impl<'a> OldRun<'a> {
@@ -527,37 +662,46 @@ impl<'a> OldRun<'a> {
         self.next = None;
         let remap = self.remap;
         for item in self.it.by_ref() {
-            let (key, ids) =
+            let (key, list) =
                 item.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mapped: Vec<u32> = ids
-                .into_iter()
-                .filter_map(|oid| {
-                    let nid = remap[oid as usize];
-                    (nid != u32::MAX).then_some(nid)
-                })
-                .collect();
-            if !mapped.is_empty() {
-                self.next = Some((key, mapped));
-                return Ok(());
+            match list {
+                format::Postings::Dense(df) => {
+                    self.next = Some((key, OldGroup::Dense(df)));
+                    return Ok(());
+                }
+                format::Postings::Ids(ids) => {
+                    let mapped: Vec<u32> = ids
+                        .into_iter()
+                        .filter_map(|oid| {
+                            let nid = remap[oid as usize];
+                            (nid != u32::MAX).then_some(nid)
+                        })
+                        .collect();
+                    if !mapped.is_empty() {
+                        self.next = Some((key, OldGroup::Ids(mapped)));
+                        return Ok(());
+                    }
+                }
             }
         }
         Ok(())
     }
 }
 
-/// K-way merge of the in-memory run, spilled runs and the old-index run
-/// into the final sorted (key, ids) stream. One reusable ids buffer serves
-/// every key.
+/// K-way merge of the in-memory run, spilled runs and the reused-index
+/// runs into the final sorted (key, list) stream. One reusable ids buffer
+/// serves every key. A dense group swallows the key: the merged entry
+/// stays dense (its ids are unknowable), which only weakens the constraint.
 struct Merged<'a> {
     mem: Vec<u64>,
     mem_pos: usize,
     shards: Vec<ShardCursor>,
-    old: Option<OldRun<'a>>,
+    old: Vec<OldRun<'a>>,
     ids: Vec<u32>,
 }
 
 impl PostingsSource for Merged<'_> {
-    fn next(&mut self) -> io::Result<Option<(u32, &[u32])>> {
+    fn next(&mut self) -> io::Result<Option<(u32, PostList<'_>)>> {
         // Minimum key across all runs.
         let mut key = u32::MAX;
         let mut any = false;
@@ -571,7 +715,7 @@ impl PostingsSource for Merged<'_> {
                 any = true;
             }
         }
-        if let Some(o) = &self.old {
+        for o in &self.old {
             if let Some((k, _)) = &o.next {
                 key = key.min(*k);
                 any = true;
@@ -581,11 +725,13 @@ impl PostingsSource for Merged<'_> {
             return Ok(None);
         }
 
-        // Collect this key's ids from every run. Each run's ids are already
-        // ascending; with more than one contributing run the concatenation
-        // needs one sort.
+        // Consume this key's contribution from every run (all cursors must
+        // advance past it even when the result ends up dense). Each run's
+        // ids are already ascending; with more than one contributing run
+        // the concatenation needs one sort.
         self.ids.clear();
         let mut sources = 0u32;
+        let mut dense: Option<u64> = None;
         if self
             .mem
             .get(self.mem_pos)
@@ -612,19 +758,29 @@ impl PostingsSource for Merged<'_> {
                 }
             }
         }
-        if let Some(o) = &mut self.old {
+        for o in &mut self.old {
             if o.next.as_ref().is_some_and(|(k, _)| *k == key) {
-                sources += 1;
-                let (_, mut ids) = o.next.take().unwrap();
-                self.ids.append(&mut ids);
+                let (_, group) = o.next.take().unwrap();
+                match group {
+                    OldGroup::Ids(mut ids) => {
+                        sources += 1;
+                        self.ids.append(&mut ids);
+                    }
+                    OldGroup::Dense(df) => {
+                        dense = Some(dense.map_or(df, |d: u64| d.max(df)));
+                    }
+                }
                 o.advance()?;
             }
+        }
+        if let Some(df) = dense {
+            return Ok(Some((key, PostList::Dense(df))));
         }
         if sources > 1 {
             self.ids.sort_unstable();
             self.ids.dedup();
         }
-        Ok(Some((key, &self.ids)))
+        Ok(Some((key, PostList::Ids(&self.ids))))
     }
 }
 
@@ -659,6 +815,14 @@ mod tests {
         }
     }
 
+    /// Index bytes with the random build/parent ids masked out, so two
+    /// logically identical builds compare equal.
+    fn read_masked(p: &Path) -> Vec<u8> {
+        let mut v = std::fs::read(p).unwrap();
+        v[128..144].fill(0);
+        v
+    }
+
     #[test]
     fn spilled_build_is_byte_identical_to_in_memory() {
         let t = tempfile::tempdir().unwrap();
@@ -668,16 +832,18 @@ mod tests {
         let idx_mem = t.path().join("mem.gix");
         let idx_spill = t.path().join("spill.gix");
 
-        let s1 = build(&root, &idx_mem, None, &opts(usize::MAX)).unwrap();
-        let s2 = build(&root, &idx_spill, None, &opts(2048)).unwrap();
+        let s1 = build(&root, &idx_mem, &opts(usize::MAX)).unwrap();
+        let s2 = build(&root, &idx_spill, &opts(2048)).unwrap();
 
         assert_eq!(s1.files_indexed, s2.files_indexed);
         assert!(s1.files_indexed >= 25);
         assert_eq!(s1.files_binary, 1);
         assert_eq!(s1.files_scan_always, 1);
-        let a = std::fs::read(&idx_mem).unwrap();
-        let b = std::fs::read(&idx_spill).unwrap();
-        assert_eq!(a, b, "spilled build must produce the identical index");
+        assert_eq!(
+            read_masked(&idx_mem),
+            read_masked(&idx_spill),
+            "spilled build must produce the identical index"
+        );
 
         // Both indexes open and agree on shape.
         let r = IndexReader::open(&idx_spill).unwrap();
@@ -697,68 +863,132 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_tree_skips_rewrite() {
+    fn unchanged_tree_writes_nothing_changes_go_to_overlay() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
         write_tree(&root);
         let idx = t.path().join("noop.gix");
-        build(&root, &idx, None, &opts(usize::MAX)).unwrap();
+        let over = format::overlay_path(&idx);
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
 
-        let mtime_before = std::fs::metadata(&idx).unwrap().modified().unwrap();
+        let base_mtime = std::fs::metadata(&idx).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(30));
 
-        let old = IndexReader::open(&idx).unwrap();
-        let stats = build(&root, &idx, Some(&old), &opts(usize::MAX)).unwrap();
+        // No-op refresh: neither base nor overlay appears/changes.
+        let stats = build(&root, &idx, &opts(usize::MAX)).unwrap();
         assert_eq!(stats.files_extracted, 0);
         assert_eq!(stats.files_reused, stats.files_total);
         assert_eq!(
             std::fs::metadata(&idx).unwrap().modified().unwrap(),
-            mtime_before,
-            "an unchanged tree must not rewrite the index file"
+            base_mtime
         );
+        assert!(!over.exists(), "no-op refresh must not create an overlay");
 
-        // A subsequent real change still lands.
+        // A change lands in the overlay; the base is untouched.
         std::fs::write(root.join("f00.txt"), "changed body needle_alpha\n").unwrap();
-        let old = IndexReader::open(&idx).unwrap();
-        let stats = build(&root, &idx, Some(&old), &opts(usize::MAX)).unwrap();
+        let stats = build(&root, &idx, &opts(usize::MAX)).unwrap();
         assert_eq!(stats.files_extracted, 1);
-        assert!(std::fs::metadata(&idx).unwrap().modified().unwrap() > mtime_before);
+        assert_eq!(
+            std::fs::metadata(&idx).unwrap().modified().unwrap(),
+            base_mtime,
+            "a small change must not rewrite the base index"
+        );
+        let o = IndexReader::open(&over).unwrap();
+        assert_eq!(o.file_count(), 1);
+        assert_eq!(o.file(0).unwrap().rel_path, "f00.txt");
+        assert_eq!(o.tombstones().count(), 1); // the old f00 in the base
+        let base = IndexReader::open(&idx).unwrap();
+        assert_eq!(o.index_ids().parent_id, base.index_ids().build_id);
+
+        // No-op refresh on top of an overlay: overlay not rewritten either.
+        let over_mtime = std::fs::metadata(&over).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let stats = build(&root, &idx, &opts(usize::MAX)).unwrap();
+        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(
+            std::fs::metadata(&over).unwrap().modified().unwrap(),
+            over_mtime
+        );
     }
 
     #[test]
-    fn incremental_spill_matches_fresh() {
+    fn overlay_tracks_delete_add_and_shrinks() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();
         write_tree(&root);
-        let idx = t.path().join("inc.gix");
-        build(&root, &idx, None, &opts(2048)).unwrap();
+        let idx = t.path().join("od.gix");
+        let over = format::overlay_path(&idx);
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
 
-        // Change one file and add one (size changes, so both are detected
-        // without waiting on mtime granularity).
-        std::fs::write(
-            root.join("f03.txt"),
-            "completely new body with needle_alpha and more text\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("f25_new.txt"),
-            "a brand new file mentioning needle_alpha\n",
-        )
-        .unwrap();
+        std::fs::remove_file(root.join("f01.txt")).unwrap();
+        std::fs::write(root.join("f02.txt"), "different needle_alpha body\n").unwrap();
+        std::fs::write(root.join("added.txt"), "brand new needle_alpha\n").unwrap();
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
 
-        let old = IndexReader::open(&idx).unwrap();
-        let stats = build(&root, &idx, Some(&old), &opts(2048)).unwrap();
-        drop(old);
-        assert!(stats.files_reused > 0, "reuse path must be exercised");
+        let o = IndexReader::open(&over).unwrap();
+        // f02 (changed) + added.txt live in the overlay; f01 + f02 are
+        // superseded base ids.
+        assert_eq!(o.file_count(), 2);
+        assert_eq!(o.tombstones().count(), 2);
 
-        let idx_fresh = t.path().join("fresh.gix");
-        build(&root, &idx_fresh, None, &opts(usize::MAX)).unwrap();
+        // Dropping the added file shrinks the overlay on the next refresh.
+        std::fs::remove_file(root.join("added.txt")).unwrap();
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
+        let o = IndexReader::open(&over).unwrap();
+        assert_eq!(o.file_count(), 1);
+        assert_eq!(o.tombstones().count(), 2);
+    }
+
+    #[test]
+    fn compaction_folds_overlay_and_matches_fresh() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        // Enough files that changing most of them crosses the overlay cap
+        // (max(64, files/8)).
+        for i in 0..90 {
+            std::fs::write(
+                root.join(format!("m{i:03}.txt")),
+                format!("file {i} needle_alpha unique_token_{i:04}\n"),
+            )
+            .unwrap();
+        }
+        let idx = t.path().join("cf.gix");
+        let over = format::overlay_path(&idx);
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
+        let base_mtime = std::fs::metadata(&idx).unwrap().modified().unwrap();
+
+        // Small change first: overlay route.
+        std::fs::write(root.join("m000.txt"), "changed needle_alpha zero\n").unwrap();
+        build(&root, &idx, &opts(usize::MAX)).unwrap();
+        assert!(over.exists());
+
+        // Mass change: crosses the cap, folds into a fresh base.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        for i in 0..70 {
+            std::fs::write(
+                root.join(format!("m{i:03}.txt")),
+                format!("rewritten {i} needle_alpha beta_token_{i:04}\n"),
+            )
+            .unwrap();
+        }
+        let stats = build(&root, &idx, &opts(2048)).unwrap();
+        assert!(stats.files_reused > 0, "unchanged files still reused");
+        assert!(
+            std::fs::metadata(&idx).unwrap().modified().unwrap() > base_mtime,
+            "compaction must rewrite the base"
+        );
+        assert!(!over.exists(), "compaction must drop the overlay");
+
+        // The folded base equals a from-scratch build byte for byte.
+        let idx_fresh = t.path().join("cf-fresh.gix");
+        build(&root, &idx_fresh, &opts(usize::MAX)).unwrap();
         assert_eq!(
-            std::fs::read(&idx).unwrap(),
-            std::fs::read(&idx_fresh).unwrap(),
-            "incremental spilled rebuild must equal a fresh in-memory build"
+            read_masked(&idx),
+            read_masked(&idx_fresh),
+            "compacted rebuild must equal a fresh build"
         );
     }
 }

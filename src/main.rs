@@ -292,10 +292,18 @@ fn cmd_index(path: Option<&Path>) -> Result<(), String> {
     if let Some(parent) = idx.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let old = IndexReader::open(&idx).ok();
+    // As a detached background builder (spawned by a first search), keep the
+    // watch heartbeat fresh so concurrent searches neither self-refresh nor
+    // spawn duplicate builders while this build runs.
+    let hb = std::env::var_os("GRIX_BUILD_HEARTBEAT")
+        .map(|_| store::start_heartbeat(&idx, std::time::Duration::from_secs(5)));
     let t0 = Instant::now();
-    let stats = build::build(&root, &idx, old.as_ref(), &BuildOptions::default())
-        .map_err(|e| format!("index build failed: {e}"))?;
+    let result = build::build(&root, &idx, &BuildOptions::default())
+        .map_err(|e| format!("index build failed: {e}"));
+    if let Some(hb) = hb {
+        hb.stop_and_clear();
+    }
+    let stats = result?;
     let elapsed = t0.elapsed();
     let size = std::fs::metadata(&idx).map(|m| m.len()).unwrap_or(0);
     eprintln!(
@@ -310,6 +318,52 @@ fn cmd_index(path: Option<&Path>) -> Result<(), String> {
         human_bytes(size),
     );
     Ok(())
+}
+
+/// Claim the freshness marker for a background build. Returns false when a
+/// watcher or another builder already owns it (then nothing should spawn).
+fn claim_background_index(idx: &Path) -> bool {
+    if store::watcher_is_live(idx) {
+        return false;
+    }
+    let _ = store::write_watch_heartbeat(idx);
+    true
+}
+
+/// Fire-and-forget `grix index <root>` in a detached child. Called *after*
+/// the walk-scan answer has been printed: the walk warms the filesystem
+/// cache, so the builder rides it instead of fighting the search for cold
+/// reads. The claim from `claim_background_index` keeps racing searches off
+/// in between.
+fn spawn_background_index(idx: &Path, root: &Path) {
+    if store::watcher_is_live_other(idx) {
+        return; // someone else took over while we were scanning
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        store::remove_watch_marker(idx);
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("index")
+        .arg(root)
+        .env("GRIX_BUILD_HEARTBEAT", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    match cmd.spawn() {
+        // Deliberately not waited on: the child outlives this process (on
+        // unix the eventual zombie is reaped when we exit).
+        Ok(child) => std::mem::forget(child),
+        // Could not start it: clear the claim so searches self-refresh.
+        Err(_) => store::remove_watch_marker(idx),
+    }
 }
 
 fn cmd_watch(path: Option<&Path>) -> Result<(), String> {
@@ -340,6 +394,18 @@ fn cmd_status(path: Option<&Path>) -> Result<(), String> {
             println!("files:    {}", human_count(reader.file_count()));
             println!("trigrams: {}", human_count(reader.trigram_count()));
             println!("size:     {}", human_bytes(size));
+            let opath = grix::index::format::overlay_path(&idx);
+            if let Ok(o) = IndexReader::open(&opath) {
+                if o.index_ids().parent_id == reader.index_ids().build_id {
+                    let osize = std::fs::metadata(&opath).map(|m| m.len()).unwrap_or(0);
+                    println!(
+                        "overlay:  {} changed files, {} superseded ({}) since the base was built",
+                        human_count(o.file_count()),
+                        human_count(o.tombstones().count()),
+                        human_bytes(osize),
+                    );
+                }
+            }
             println!(
                 "watch:    {}",
                 if store::watcher_is_live(&idx) {
@@ -362,6 +428,7 @@ fn cmd_forget(path: Option<&Path>) -> Result<(), String> {
     match store::find_index_upward(start) {
         Some((idx, root)) => {
             std::fs::remove_file(&idx).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(grix::index::format::overlay_path(&idx));
             eprintln!("removed index for {}", root.display());
             Ok(())
         }
@@ -587,6 +654,9 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     // Set when a live `grix watch` daemon owns freshness for this index, so we
     // neither refresh nor warn about staleness below.
     let mut watcher_live = false;
+    // Deferred background build: spawned after results are printed, so the
+    // walk-scan and the builder don't fight over a cold filesystem cache.
+    let mut background_index: Option<(PathBuf, PathBuf)> = None;
     let (results, stats) = if cli.no_index {
         let root =
             store::canonical_root(&anchor).map_err(|e| format!("cannot resolve path: {e}"))?;
@@ -594,34 +664,63 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
         search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
     } else {
-        // Find (or build) an index that covers the current directory.
-        let found = store::find_index_upward(&anchor);
-        let (idx, root) = match found {
+        match store::find_index_upward(&anchor) {
             Some((idx, root)) => {
-                // Keep the index current: a quick incremental refresh before
-                // searching so files added/changed since the last build are
-                // picked up. Unchanged files are reused (no re-read), so this
-                // is a directory walk + stat, not a full rebuild. Skipped with
-                // --no-auto-index, or when a `grix watch` daemon is already
-                // keeping the index fresh (then the walk is pure waste).
                 watcher_live = store::watcher_is_live(&idx);
-                if !cli.no_auto_index && !watcher_live {
-                    let old = IndexReader::open(&idx).ok();
-                    let t = Instant::now();
-                    match build::build(&root, &idx, old.as_ref(), &BuildOptions::default()) {
-                        Ok(bstats) if cli.stats => eprintln!(
-                            "refresh:     {} changed/new, {} reused in {:.2}s",
-                            human_count(bstats.files_extracted),
-                            human_count(bstats.files_reused),
-                            t.elapsed().as_secs_f64()
-                        ),
-                        Ok(_) => {}
-                        // A failed refresh is non-fatal: fall back to the
-                        // existing index rather than abort the search.
-                        Err(e) => eprintln!("grix: index refresh skipped ({e})"),
+                let usable = IndexReader::open(&idx).is_ok();
+                if !usable && !cli.no_auto_index {
+                    // Old format or corrupt: rebuild in a detached child and
+                    // answer this search from a full walk right now — the
+                    // user never waits on a from-scratch build.
+                    if claim_background_index(&idx) {
+                        background_index = Some((idx.clone(), root.clone()));
                     }
+                    eprintln!(
+                        "grix: index needs a rebuild - this search runs as a full scan; rebuilding in the background..."
+                    );
+                    let mut opts = opts.clone();
+                    opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
+                    search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
+                } else {
+                    // Keep the index current: a quick incremental refresh
+                    // before searching so files added/changed since the last
+                    // build are picked up. Changes land in the overlay, so
+                    // this costs a walk + the churn since the base was
+                    // built. Skipped with --no-auto-index, or when a `grix
+                    // watch` daemon (or background builder) owns freshness.
+                    if usable && !cli.no_auto_index && !watcher_live {
+                        let t = Instant::now();
+                        match build::build(&root, &idx, &BuildOptions::default()) {
+                            Ok(bstats) if cli.stats => eprintln!(
+                                "refresh:     {} changed/new, {} reused in {:.2}s",
+                                human_count(bstats.files_extracted),
+                                human_count(bstats.files_reused),
+                                t.elapsed().as_secs_f64()
+                            ),
+                            Ok(_) => {}
+                            // A failed refresh is non-fatal: fall back to the
+                            // existing index rather than abort the search.
+                            Err(e) => eprintln!("grix: index refresh skipped ({e})"),
+                        }
+                    }
+                    let reader = match IndexReader::open(&idx) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return Err(format!(
+                                "cannot open index ({e}); run grix index to rebuild, or use --no-index"
+                            ));
+                        }
+                    };
+                    // Changes since the base was built live in the sidecar overlay.
+                    let overlay = IndexReader::open(&grix::index::format::overlay_path(&idx))
+                        .ok()
+                        .filter(|o| o.index_ids().parent_id == reader.index_ids().build_id);
+                    let view = search::View::new(&reader, overlay.as_ref());
+                    let mut opts = opts.clone();
+                    opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
+                    search::search_index(&view, &root, &matcher, &opts)
+                        .map_err(|e| e.to_string())?
                 }
-                (idx, root)
             }
             None => {
                 if cli.no_auto_index {
@@ -632,36 +731,26 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
                 }
                 let root = store::canonical_root(&anchor)
                     .map_err(|e| format!("cannot resolve path: {e}"))?;
-                eprintln!(
-                    "grix: no index for {} - building one (first run only)...",
-                    root.display()
-                );
                 let idx = store::index_path(&root).map_err(|e| e.to_string())?;
                 if let Some(parent) = idx.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
-                let t = Instant::now();
-                let bstats = build::build(&root, &idx, None, &BuildOptions::default())
-                    .map_err(|e| format!("index build failed: {e}"))?;
+                // First contact with this tree: answer from a full walk now,
+                // build the index in a detached child. Search results are
+                // identical either way; only the speed differs until the
+                // index lands.
+                if claim_background_index(&idx) {
+                    background_index = Some((idx.clone(), root.clone()));
+                }
                 eprintln!(
-                    "grix: indexed {} files in {:.2}s",
-                    human_count(bstats.files_total),
-                    t.elapsed().as_secs_f64()
+                    "grix: no index for {} - this search runs as a full scan; building the index in the background...",
+                    root.display()
                 );
-                (idx, root)
+                let mut opts = opts.clone();
+                opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
+                search::search_walk(&root, &matcher, &opts).map_err(|e| e.to_string())?
             }
-        };
-        let reader = match IndexReader::open(&idx) {
-            Ok(r) => r,
-            Err(e) => {
-                return Err(format!(
-                    "cannot open index ({e}); run grix index to rebuild, or use --no-index"
-                ));
-            }
-        };
-        let mut opts = opts.clone();
-        opts.path_scopes = paths_to_scopes(&cli.paths, &root)?;
-        search::search_index(&reader, &root, &matcher, &opts).map_err(|e| e.to_string())?
+        }
     };
     let total_elapsed = t0.elapsed();
 
@@ -684,6 +773,12 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             return Err(e.to_string());
         }
+    }
+
+    // The answer is out; now start the deferred background build (the walk
+    // above just warmed the filesystem cache for it).
+    if let Some((idx, root)) = &background_index {
+        spawn_background_index(idx, root);
     }
 
     if cli.stats {

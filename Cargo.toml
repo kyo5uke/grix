@@ -1,6 +1,6 @@
 [package]
 name = "grix"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["kyosuke <h.kyosuke0505@gmail.com>"]
 description = "grep with a trigram index: exact, ripgrep-compatible code search from a live index — plus an MCP server for AI coding agents. Not RAG."

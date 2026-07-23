@@ -97,13 +97,13 @@ logic that provably preserves semantics.
 
 ## The index file
 
-One file per indexed root, in your cache directory (`%LOCALAPPDATA%\grix`
-or `~/.cache/grix`) — repositories are never touched. Little-endian,
-mmap-friendly (format `GRIXIDX2`):
+One base file per indexed root, in your cache directory
+(`%LOCALAPPDATA%\grix` or `~/.cache/grix`) — repositories are never
+touched. Little-endian, mmap-friendly (format `GRIXIDX3`):
 
 ```
 [magic][header][root path][paths blob][file table][scan-always ids]
-[trigram table][postings]
+[tombstones][trigram table][postings]
 ```
 
 - **file table**: fixed-width entries (path, size, mtime, flags) — the
@@ -112,13 +112,25 @@ mmap-friendly (format `GRIXIDX2`):
   own section, so a query only ever touches its candidates' metadata — no
   per-search walk over the whole file table.
 - **trigram table**: sorted fixed-width entries; a posting list is found by
-  binary search and decoded lazily.
+  binary search and decoded lazily. A trigram that occurred in more than a
+  quarter of all files is stored **dense**: its id list narrows nothing, so
+  only its document frequency is kept and a query treats it as "matches
+  everything" — strictly weakening the index constraint, never dropping
+  results. This alone shrinks the index by ~20%.
 - **postings**: per-trigram sorted file ids, delta + LEB128 encoded.
-  The linux kernel source (92,823 files, ~1.4 GB) indexes to 162 MiB with
+  The linux kernel source (92,823 files, ~1.4 GB) indexes to ~126 MiB with
   this scheme.
 
-Older index versions are rejected on open with a version error; the
-before-search refresh then rebuilds them transparently.
+The same format serves a second role: a small sidecar **overlay**
+(`.gixo`) holding only what changed since the base was built, plus the
+base ids it supersedes (the tombstones section). Base and overlay are tied
+together by a build id in the header, so a stale overlay can never be
+applied to the wrong base. Searches evaluate `(base − tombstones) ∪
+overlay` through one view; ids stay disjoint by offsetting overlay ids
+past the base's.
+
+Older index versions are rejected on open with a version error; searches
+then answer from a full scan while a rebuild runs in the background.
 
 Every read is bounds-checked; a corrupted index produces an error (and a
 rebuild hint), never undefined behavior.
@@ -146,12 +158,29 @@ peak memory stays bounded no matter how large the tree is.
 `grix index` on an already-indexed tree:
 
 1. Walk the tree (parallel), collect (path, size, mtime), sort by path.
-2. If nothing changed at all, stop — the index file is not rewritten.
-3. Files whose (size, mtime) match the old index are **reused**: their
-   postings stream out of the old index with ids remapped, as one merge
-   input — their bytes are never read again. The remap preserves sort
-   order, so posting lists stay sorted by construction.
-4. Only new/changed files are read and extracted (in parallel).
+2. If nothing changed at all, stop — nothing is written.
+3. Otherwise only the **overlay** is rewritten: changed/new files are read
+   and extracted (in parallel), unchanged overlay entries stream out of the
+   old overlay id-remapped, and superseded base ids become tombstones. The
+   base index — usually >99% of the data — is not touched, so a refresh
+   costs the walk plus the churn since the base was built, not the tree
+   size (measured: ~0.5 s for a one-file change on the kernel tree, vs
+   rewriting a 130 MiB index).
+4. When the overlay outgrows its budget (`max(64, files/8)` entries or a
+   comparable tombstone count), everything folds into a fresh base in one
+   full build — which itself reuses postings from both old files — and the
+   overlay is dropped. A compacted base is byte-identical to a
+   from-scratch build (tested).
+
+## First contact
+
+A search with no index (or an old-format one) does not wait for a build:
+it answers immediately from a parallel full scan — the same results, just
+at grep speed — and spawns a detached `grix index` child. The child holds
+the watch heartbeat while it builds, so concurrent searches neither
+self-refresh nor spawn duplicate builders; the spawn happens after the
+answer is printed so the scan's warmed file cache benefits the builder
+instead of competing with it.
 
 ## The confirming scan
 

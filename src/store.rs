@@ -127,6 +127,21 @@ pub fn watcher_is_live(index_path: &Path) -> bool {
     watcher_is_live_at(&s, now_millis())
 }
 
+/// Like `watcher_is_live`, but a fresh marker written by *this* process does
+/// not count. Used when deciding whether to spawn a background builder after
+/// having claimed the marker ourselves earlier in the run.
+pub fn watcher_is_live_other(index_path: &Path) -> bool {
+    let Ok(s) = std::fs::read_to_string(watch_marker_path(index_path)) else {
+        return false;
+    };
+    let other_pid = s
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u32>().ok())
+        .map_or(true, |pid| pid != std::process::id());
+    other_pid && watcher_is_live_at(&s, now_millis())
+}
+
 /// Testable core: is the marker's heartbeat fresh relative to `now`?
 fn watcher_is_live_at(marker: &str, now: u64) -> bool {
     let Some(hb) = marker
@@ -137,6 +152,42 @@ fn watcher_is_live_at(marker: &str, now: u64) -> bool {
         return false;
     };
     now >= hb && now - hb < WATCH_FRESH_MS
+}
+
+/// A background thread keeping the watch heartbeat fresh. While it runs,
+/// searches treat the index as watched and skip their own refresh — used by
+/// `grix watch` and by detached background index builds. `stop_and_clear`
+/// joins the thread *before* removing the marker, so no late beat can
+/// resurrect it.
+pub struct Heartbeat {
+    stop: std::sync::mpsc::Sender<()>,
+    handle: std::thread::JoinHandle<()>,
+    index_path: PathBuf,
+}
+
+pub fn start_heartbeat(index_path: &Path, every: std::time::Duration) -> Heartbeat {
+    let (stop, rx) = std::sync::mpsc::channel::<()>();
+    let p = index_path.to_path_buf();
+    let handle = std::thread::spawn(move || loop {
+        let _ = write_watch_heartbeat(&p);
+        match rx.recv_timeout(every) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            _ => break, // stop: sender dropped
+        }
+    });
+    Heartbeat {
+        stop,
+        handle,
+        index_path: index_path.to_path_buf(),
+    }
+}
+
+impl Heartbeat {
+    pub fn stop_and_clear(self) {
+        drop(self.stop);
+        let _ = self.handle.join();
+        remove_watch_marker(&self.index_path);
+    }
 }
 
 #[cfg(test)]

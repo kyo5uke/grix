@@ -21,7 +21,6 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::index::build::{self, BuildOptions};
-use crate::index::format::IndexReader;
 use crate::store;
 
 /// Quiet period after the last change before reindexing.
@@ -86,8 +85,7 @@ fn reindex_with_retry(
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(200));
         }
-        let old = IndexReader::open(index_path).ok();
-        match build::build(root, index_path, old.as_ref(), opts) {
+        match build::build(root, index_path, opts) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
@@ -104,24 +102,10 @@ pub fn run(root: &Path, index_path: &Path, opts: &BuildOptions) -> io::Result<()
     // Heartbeat on its own thread: a build can take tens of seconds on a
     // large tree, and a blocked main loop must not let the marker go stale
     // (concurrent searches would start competing builds and rename-race the
-    // index). The channel doubles as the stop signal — dropping the sender
-    // wakes the thread immediately — and joining *before* removing the
-    // marker guarantees no late beat resurrects it after cleanup.
-    let (hb_stop, hb_rx) = channel::<()>();
-    let hb = {
-        let idx = index_path.to_path_buf();
-        std::thread::spawn(move || loop {
-            let _ = store::write_watch_heartbeat(&idx);
-            match hb_rx.recv_timeout(HEARTBEAT_EVERY) {
-                Err(RecvTimeoutError::Timeout) => continue,
-                _ => break, // stop: sender dropped
-            }
-        })
-    };
+    // index).
+    let hb = store::start_heartbeat(index_path, HEARTBEAT_EVERY);
     let result = watch_loop(root, index_path, opts);
-    drop(hb_stop);
-    let _ = hb.join();
-    store::remove_watch_marker(index_path);
+    hb.stop_and_clear();
     result
 }
 
