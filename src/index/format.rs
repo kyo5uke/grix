@@ -41,8 +41,8 @@ use memmap2::Mmap;
 
 use crate::varint;
 
-pub const MAGIC: &[u8; 8] = b"GRIXIDX3";
-pub const VERSION: u32 = 3;
+pub const MAGIC: &[u8; 8] = b"GRIXIDX4";
+pub const VERSION: u32 = 4;
 const HEADER_LEN: usize = 160;
 
 /// Sentinel in a trigram-table `len` field: dense trigram, no stored ids.
@@ -163,6 +163,13 @@ fn sweep_stale_temps_older_than(index_path: &Path, max_age: Duration) {
 pub const FLAG_SCAN_ALWAYS: u32 = 1;
 /// File looked binary (NUL byte); excluded from search entirely.
 pub const FLAG_BINARY: u32 = 2;
+/// Hidden file (dotted path component, or the hidden attribute on
+/// Windows). Indexed like everything else but only searched with --hidden.
+pub const FLAG_HIDDEN: u32 = 4;
+
+/// The flags that decide whether a file's contents live in the postings.
+/// Hidden is orthogonal: hidden text files are fully indexed.
+pub const FLAG_UNINDEXED: u32 = FLAG_SCAN_ALWAYS | FLAG_BINARY;
 
 #[derive(Debug, Clone)]
 pub struct FileRecord {

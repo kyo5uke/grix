@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::index::format::{
-    FileMeta, IndexError, IndexReader, Postings, FLAG_BINARY, FLAG_SCAN_ALWAYS,
+    FileMeta, IndexError, IndexReader, Postings, FLAG_BINARY, FLAG_HIDDEN, FLAG_SCAN_ALWAYS,
 };
 use crate::plan::{self, Query};
 use crate::trigram;
@@ -108,8 +108,9 @@ impl<'a> View<'a> {
         Ok(IdSet::Ids(ids))
     }
 
-    /// Every alive id (the top-level `ALL` materialization).
-    fn all_ids(&self) -> Vec<u32> {
+    /// Every alive id (the top-level `ALL` materialization; also the
+    /// `--files` listing, which never needs a walk).
+    pub fn all_ids(&self) -> Vec<u32> {
         let b = self.base_count();
         let mut v: Vec<u32> = (0..b).filter(|&i| !self.is_dead(i)).collect();
         if let Some(o) = self.overlay {
@@ -168,6 +169,12 @@ pub struct SearchOptions {
     /// Case-insensitive iff the pattern has no uppercase literal (-S).
     /// An explicit `case_insensitive` wins.
     pub smart_case: bool,
+    /// Search hidden files too (--hidden). They are in the index either
+    /// way; this only controls whether they are candidates.
+    pub hidden: bool,
+    /// Ignore the ignore rules (--no-ignore / -u). The index only covers
+    /// non-ignored files, so this forces a walk-scan.
+    pub no_ignore: bool,
     /// Glob filters (-g). A leading `!` excludes; otherwise, the presence of
     /// any positive glob restricts results to files that match one.
     pub globs: Vec<String>,
@@ -267,6 +274,8 @@ impl Default for SearchOptions {
             invert: false,
             only_matching: false,
             smart_case: false,
+            hidden: false,
+            no_ignore: false,
             globs: Vec::new(),
             types_select: Vec::new(),
             types_negate: Vec::new(),
@@ -1245,6 +1254,9 @@ pub fn search_index(
             if meta.flags & FLAG_BINARY != 0 {
                 return Ok(());
             }
+            if meta.flags & FLAG_HIDDEN != 0 && !opts.hidden {
+                return Ok(());
+            }
             if skip_scan_always && meta.flags & FLAG_SCAN_ALWAYS != 0 {
                 return Ok(()); // added from the scan-always section instead
             }
@@ -1289,7 +1301,10 @@ pub fn search_walk(
 
     let filter = FileFilter::build(opts)?;
     let mut targets: Vec<(u32, String, u64)> = Vec::new();
-    for cand in crate::index::build::collect_candidates(root, opts.threads)? {
+    for cand in crate::index::build::collect_candidates(root, opts.threads, opts.no_ignore)? {
+        if cand.hidden && !opts.hidden {
+            continue;
+        }
         if !in_scope(&cand.rel_path, &opts.path_scopes) || !filter.accept(&cand.rel_path) {
             continue;
         }

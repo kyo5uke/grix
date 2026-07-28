@@ -178,9 +178,15 @@ The main supported forms are:
 
 The everyday ripgrep flags are all covered:
 
-`-i`, `-S`, `-F`, `-e`, `-w`, `-v`, `-o`, `-l`, `-c`, `-m`, `-A`, `-B`, `-C`,
-`-g`, `-t`, `-T`, `-U`, `-r`/`--replace`, `--`, `--json`, `--no-heading`,
-`--color`
+`-i`, `-S`, `-F`, `-e` (repeatable), `-w`, `-v`, `-o`, `-l`, `-c`, `-m`,
+`-A`, `-B`, `-C`, `-g`, `-t`, `-T`, `-U`, `-r`/`--replace`, `--hidden`,
+`--no-ignore`/`-u`/`-uu`, `--files`, `--type-list`, `--`, `--json`,
+`--no-heading`, `--color`
+
+Hidden files are in the index (marked, excluded by default), so `--hidden`
+is instant too. `--no-ignore` reaches files the index deliberately skips,
+so it searches at grep speed. `.git` is never searched, with or without
+`--hidden`.
 
 Each one is verified against ripgrep's actual output on the Linux kernel
 tree (including the corner cases: `-w` uses rg's surrounded-by semantics,

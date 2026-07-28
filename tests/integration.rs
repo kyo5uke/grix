@@ -60,6 +60,9 @@ fn fixture() -> Fixture {
         big.extend_from_slice(format!("filler line {i} with foo inside\n").as_bytes());
     }
     write(&root, "data/big.log", &big);
+    // Hidden files: indexed, but only searched with --hidden.
+    write(&root, ".dotfile.txt", b"foo in dotfile\n");
+    write(&root, ".hiddendir/nested.txt", b"foo nested hidden\n");
     // Ignored file must not be searched. Like ripgrep, .gitignore only
     // applies inside a git repository, so give the fixture a .git dir.
     std::fs::create_dir(root.join(".git")).unwrap();
@@ -307,6 +310,43 @@ fn flag_modes_equal_full_scan() {
             );
         }
     }
+}
+
+#[test]
+fn hidden_and_no_ignore() {
+    let fx = fixture();
+    build_fixture_index(&fx);
+
+    // Default: hidden files stay invisible (but they ARE in the index).
+    let opts = SearchOptions::default();
+    let (r, _) = search_all(&fx, "foo", &opts);
+    assert!(!result_set(&r).iter().any(|(p, _)| p.starts_with('.')));
+
+    // --hidden serves them straight from the index, no rebuild.
+    let opts_h = SearchOptions {
+        hidden: true,
+        ..Default::default()
+    };
+    let (r, _) = search_all(&fx, "foo", &opts_h);
+    let set = result_set(&r);
+    assert!(set.contains(&(".dotfile.txt".into(), 1)));
+    assert!(set.contains(&(".hiddendir/nested.txt".into(), 1)));
+
+    // Equivalence with a walk under --hidden.
+    let matcher = search::compile("foo", &opts_h).unwrap();
+    let (w, _) = search::search_walk(&fx.root, &matcher, &opts_h).unwrap();
+    assert_eq!(set, result_set(&w));
+
+    // --no-ignore (always a walk) reaches the gitignored file.
+    let opts_u = SearchOptions {
+        no_ignore: true,
+        ..Default::default()
+    };
+    let matcher = search::compile("foo", &opts_u).unwrap();
+    let (w, _) = search::search_walk(&fx.root, &matcher, &opts_u).unwrap();
+    assert!(result_set(&w).iter().any(|(p, _)| p == "ignored.txt"));
+    // .git contents stay pruned even with everything else off.
+    assert!(!result_set(&w).iter().any(|(p, _)| p.starts_with(".git/")));
 }
 
 #[test]

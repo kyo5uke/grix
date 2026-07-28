@@ -129,6 +129,7 @@ fn tool_schemas() -> Value {
                     "multiline": {"type": "boolean", "description": "matches may span lines (like rg -U)"},
                     "word": {"type": "boolean", "description": "only match at word boundaries (like rg -w)"},
                     "invert": {"type": "boolean", "description": "return non-matching lines (like rg -v; scans every file)"},
+                    "hidden": {"type": "boolean", "description": "search hidden files too (like rg --hidden)"},
                     "replace": {"type": "string", "description": "replace matches in the output with this text ($1/$name refs); files are never modified"},
                     "context": {"type": "integer", "description": "lines of context to show around each match"},
                     "max_results": {"type": "integer", "description": "cap on matched lines returned (default 200)"}
@@ -201,6 +202,7 @@ fn build_opts(args: &Value, root: &Path) -> SearchOptions {
             .unwrap_or(false),
         word: args.get("word").and_then(Value::as_bool).unwrap_or(false),
         invert: args.get("invert").and_then(Value::as_bool).unwrap_or(false),
+        hidden: args.get("hidden").and_then(Value::as_bool).unwrap_or(false),
         replace: args
             .get("replace")
             .and_then(Value::as_str)

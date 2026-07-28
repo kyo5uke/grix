@@ -27,7 +27,8 @@ USAGE:
 OPTIONS:
     -i              case-insensitive search
     -F              treat the pattern as a literal string
-    -e <PATTERN>    use PATTERN (needed for patterns starting with '-')
+    -e <PATTERN>    use PATTERN; repeat to match any of several patterns
+                    (also needed for patterns starting with '-')
     --              end of options; everything after is pattern/paths
     -U              multiline: matches may span lines (shows every line touched)
     -r <TEXT>       replace matches with TEXT in the output ($1/$name refs;
@@ -36,7 +37,12 @@ OPTIONS:
     -v              invert: print non-matching lines (cannot use the index)
     -o              print each match on its own line instead of the whole line
     -S              smart case: insensitive unless the pattern has uppercase
+    --hidden        search hidden files too (.dotfiles; indexed either way)
+    --no-ignore, -u ignore the ignore rules; searches via a full scan
+    -uu             --no-ignore plus --hidden
     -l              list matching files only
+    --files         list every file the index covers (no pattern; instant)
+    --type-list     show all file types usable with -t / -T
     -c              print per-file match counts
     -m <N>          stop after N matching lines per file
     -A <N>          show N lines of context after each match
@@ -59,7 +65,9 @@ OPTIONS:
 ";
 
 struct Cli {
-    pattern: Option<String>,
+    /// Search patterns; more than one (repeated -e) matches like rg: any of
+    /// them. Combined into one alternation before compiling.
+    patterns: Vec<String>,
     path: Option<PathBuf>,
     /// Extra path arguments for `search`: files/dirs to scope the search to.
     paths: Vec<PathBuf>,
@@ -72,6 +80,10 @@ struct Cli {
     invert: bool,
     only_matching: bool,
     smart_case: bool,
+    files_list: bool,
+    type_list: bool,
+    hidden: bool,
+    no_ignore: bool,
     files_only: bool,
     counts: bool,
     max_count: Option<u64>,
@@ -108,7 +120,7 @@ enum ColorChoice {
 
 fn parse_args() -> Result<Cli, String> {
     let mut cli = Cli {
-        pattern: None,
+        patterns: Vec::new(),
         path: None,
         paths: Vec::new(),
         command: Cmd::Search,
@@ -120,6 +132,10 @@ fn parse_args() -> Result<Cli, String> {
         invert: false,
         only_matching: false,
         smart_case: false,
+        files_list: false,
+        type_list: false,
+        hidden: false,
+        no_ignore: false,
         files_only: false,
         counts: false,
         max_count: None,
@@ -138,7 +154,7 @@ fn parse_args() -> Result<Cli, String> {
     };
     let mut args = std::env::args().skip(1).peekable();
     let mut positionals: Vec<String> = Vec::new();
-    let mut pattern_flag: Option<String> = None;
+    let mut e_patterns: Vec<String> = Vec::new();
     // A subcommand word is only recognized in the very first argument slot.
     // Once any option (or `--`) precedes it, a leading positional is a
     // pattern, so `grix -F index` searches for "index" instead of indexing.
@@ -161,13 +177,26 @@ fn parse_args() -> Result<Cli, String> {
                 let v = args.next().ok_or("-r needs replacement text")?;
                 cli.replace = Some(v);
             }
+            "--files" => cli.files_list = true,
+            "--type-list" => cli.type_list = true,
+            "--hidden" => cli.hidden = true,
+            "--no-ignore" | "-u" => cli.no_ignore = true,
+            "-uu" => {
+                cli.no_ignore = true;
+                cli.hidden = true;
+            }
+            "-uuu" => {
+                return Err(
+                    "-uuu (searching binary files) is not supported; the closest is -uu".into(),
+                );
+            }
             "-w" | "--word-regexp" => cli.word = true,
             "-v" | "--invert-match" => cli.invert = true,
             "-o" | "--only-matching" => cli.only_matching = true,
             "-S" | "--smart-case" => cli.smart_case = true,
             "-e" => {
                 let v = args.next().ok_or("-e needs a pattern")?;
-                pattern_flag = Some(v);
+                e_patterns.push(v);
             }
             "--" => {
                 if positionals.is_empty() {
@@ -245,12 +274,15 @@ fn parse_args() -> Result<Cli, String> {
         }
     }
 
-    if pattern_flag.is_some() || no_subcommand {
-        cli.pattern = match pattern_flag {
-            Some(p) => Some(p),
-            None if positionals.is_empty() => return Err("missing pattern (try --help)".into()),
-            None => Some(positionals.remove(0)),
-        };
+    if !e_patterns.is_empty() || no_subcommand {
+        // --files / --type-list need no pattern; positionals are all paths.
+        if e_patterns.is_empty() && !cli.files_list && !cli.type_list {
+            if positionals.is_empty() {
+                return Err("missing pattern (try --help)".into());
+            }
+            e_patterns.push(positionals.remove(0));
+        }
+        cli.patterns = e_patterns;
         cli.paths = positionals.iter().map(PathBuf::from).collect();
         return Ok(cli);
     }
@@ -276,7 +308,7 @@ fn parse_args() -> Result<Cli, String> {
             cli.path = positionals.get(1).map(PathBuf::from);
         }
         Some(_) => {
-            cli.pattern = Some(positionals.remove(0));
+            cli.patterns = vec![positionals.remove(0)];
             cli.paths = positionals.iter().map(PathBuf::from).collect();
         }
         None => return Err("missing pattern (try --help)".into()),
@@ -652,8 +684,158 @@ fn paths_to_scopes(paths: &[PathBuf], root: &Path) -> Result<Vec<String>, String
     Ok(scopes)
 }
 
+/// `--type-list`: the type definitions -t / -T accept, like rg.
+fn cmd_type_list() -> Result<ExitCode, String> {
+    let mut b = ignore::types::TypesBuilder::new();
+    b.add_defaults();
+    let types = b.build().map_err(|e| e.to_string())?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for def in types.definitions() {
+        let _ = writeln!(out, "{}: {}", def.name(), def.globs().join(", "));
+    }
+    let _ = out.flush();
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `--files`: list every file a search would consider. With an index this
+/// is a table read — no directory walk at all.
+fn cmd_files(cli: &Cli) -> Result<ExitCode, String> {
+    let opts = SearchOptions {
+        globs: cli.globs.clone(),
+        types_select: cli.types_select.clone(),
+        types_negate: cli.types_negate.clone(),
+        ..Default::default()
+    };
+    let filter = search::FileFilter::build(&opts).map_err(|e| e.to_string())?;
+    let anchor = PathBuf::from(".");
+
+    let walk_list = |root: &Path, scopes: &[String]| -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for c in build::collect_candidates(root, opts.threads, cli.no_ignore)
+            .map_err(|e| e.to_string())?
+        {
+            if c.hidden && !cli.hidden {
+                continue;
+            }
+            if search::in_scope(&c.rel_path, scopes) && filter.accept(&c.rel_path) {
+                names.push(c.rel_path);
+            }
+        }
+        Ok(names)
+    };
+
+    let mut names: Vec<String>;
+    if cli.no_index || cli.no_ignore {
+        let root =
+            store::canonical_root(&anchor).map_err(|e| format!("cannot resolve path: {e}"))?;
+        let scopes = paths_to_scopes(&cli.paths, &root)?;
+        names = walk_list(&root, &scopes)?;
+    } else {
+        match store::find_index_upward(&anchor) {
+            Some((idx, root)) => {
+                let watcher_live = store::watcher_is_live(&idx);
+                let usable = IndexReader::open(&idx).is_ok();
+                let scopes = paths_to_scopes(&cli.paths, &root)?;
+                if !usable && !cli.no_auto_index {
+                    // Old format: rebuild in the background, list via a
+                    // walk now (metadata only, so no cold-read contention).
+                    if claim_background_index(&idx) {
+                        spawn_background_index(&idx, &root);
+                    }
+                    names = walk_list(&root, &scopes)?;
+                } else {
+                    if usable && !cli.no_auto_index && !watcher_live {
+                        if let Err(e) = build::build(&root, &idx, &BuildOptions::default()) {
+                            eprintln!("grix: index refresh skipped ({e})");
+                        }
+                    }
+                    let reader = IndexReader::open(&idx).map_err(|e| {
+                        format!("cannot open index ({e}); run grix index, or use --no-index")
+                    })?;
+                    let overlay = IndexReader::open(&grix::index::format::overlay_path(&idx))
+                        .ok()
+                        .filter(|o| o.index_ids().parent_id == reader.index_ids().build_id);
+                    let view = search::View::new(&reader, overlay.as_ref());
+                    names = Vec::with_capacity(view.file_count());
+                    for id in view.all_ids() {
+                        let meta = view.file(id).map_err(|e| e.to_string())?;
+                        if meta.flags & grix::index::format::FLAG_HIDDEN != 0 && !cli.hidden {
+                            continue;
+                        }
+                        if search::in_scope(meta.rel_path, &scopes) && filter.accept(meta.rel_path)
+                        {
+                            names.push(meta.rel_path.to_string());
+                        }
+                    }
+                }
+            }
+            None => {
+                if cli.no_auto_index {
+                    return Err(
+                        "no index covers the current directory (run: grix index, or pass --no-index)"
+                            .to_string(),
+                    );
+                }
+                let root = store::canonical_root(&anchor)
+                    .map_err(|e| format!("cannot resolve path: {e}"))?;
+                let idx = store::index_path(&root).map_err(|e| e.to_string())?;
+                if let Some(parent) = idx.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                if claim_background_index(&idx) {
+                    spawn_background_index(&idx, &root);
+                }
+                let scopes = paths_to_scopes(&cli.paths, &root)?;
+                names = walk_list(&root, &scopes)?;
+            }
+        }
+    }
+
+    names.sort_unstable();
+    let empty = names.is_empty();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for n in &names {
+        if writeln!(out, "{n}").is_err() {
+            break; // downstream closed the pipe
+        }
+    }
+    let _ = out.flush();
+    Ok(if empty {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
 fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
-    let pattern = cli.pattern.as_deref().expect("pattern checked in parse");
+    if cli.type_list {
+        return cmd_type_list();
+    }
+    if cli.files_list {
+        return cmd_files(cli);
+    }
+    // Repeated -e patterns match like rg: any of them. Fixed strings are
+    // escaped here so the alternation itself stays a regex.
+    let mut fixed = cli.fixed;
+    let pattern_owned = match cli.patterns.len() {
+        0 => return Err("missing pattern (try --help)".into()),
+        1 => cli.patterns[0].clone(),
+        _ => {
+            let parts: Vec<String> = if cli.fixed {
+                fixed = false;
+                cli.patterns
+                    .iter()
+                    .map(|p| regex_syntax::escape(p))
+                    .collect()
+            } else {
+                cli.patterns.iter().map(|p| format!("(?:{p})")).collect()
+            };
+            parts.join("|")
+        }
+    };
+    let pattern = pattern_owned.as_str();
     // The index is anchored at the current directory; path arguments scope
     // the search *within* it rather than choosing a different index.
     let anchor = PathBuf::from(".");
@@ -663,7 +845,7 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     let want_context = !cli.files_only && !cli.counts && !cli.json && !cli.only_matching;
     let opts = SearchOptions {
         case_insensitive: cli.case_insensitive,
-        fixed_string: cli.fixed,
+        fixed_string: fixed,
         matches_only: cli.files_only,
         multiline: cli.multiline,
         replace: cli.replace.clone().map(String::into_bytes),
@@ -671,6 +853,8 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
         invert: cli.invert,
         only_matching: cli.only_matching,
         smart_case: cli.smart_case,
+        hidden: cli.hidden,
+        no_ignore: cli.no_ignore,
         max_count: cli.max_count,
         before: if want_context { cli.before } else { 0 },
         after: if want_context { cli.after } else { 0 },
@@ -693,7 +877,10 @@ fn cmd_search(cli: &Cli) -> Result<ExitCode, String> {
     // Deferred background build: spawned after results are printed, so the
     // walk-scan and the builder don't fight over a cold filesystem cache.
     let mut background_index: Option<(PathBuf, PathBuf)> = None;
-    let (results, stats) = if cli.no_index {
+    // --no-ignore searches files the index deliberately does not cover
+    // (gitignored build output etc.), so it runs as a walk-scan like
+    // --no-index.
+    let (results, stats) = if cli.no_index || cli.no_ignore {
         let root =
             store::canonical_root(&anchor).map_err(|e| format!("cannot resolve path: {e}"))?;
         let mut opts = opts.clone();

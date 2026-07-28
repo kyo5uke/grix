@@ -24,7 +24,8 @@ use std::sync::mpsc;
 use std::time::UNIX_EPOCH;
 
 use super::format::{
-    self, FileRecord, IndexReader, PostList, PostingsSource, FLAG_BINARY, FLAG_SCAN_ALWAYS,
+    self, FileRecord, IndexReader, PostList, PostingsSource, FLAG_BINARY, FLAG_HIDDEN,
+    FLAG_SCAN_ALWAYS, FLAG_UNINDEXED,
 };
 use crate::trigram::{self, TriSet};
 
@@ -72,6 +73,8 @@ pub struct Candidate {
     pub rel_path: String,
     pub size: u64,
     pub mtime: u64,
+    /// Dotted path component, or the hidden attribute on Windows.
+    pub hidden: bool,
 }
 
 fn mtime_nanos(md: &std::fs::Metadata) -> u64 {
@@ -94,15 +97,43 @@ fn rel_string(rel: &Path) -> String {
     out
 }
 
+#[cfg(windows)]
+fn attr_hidden(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    md.file_attributes() & 0x2 != 0 // FILE_ATTRIBUTE_HIDDEN
+}
+
+#[cfg(not(windows))]
+fn attr_hidden(_md: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// Walk `root` in parallel and return indexable candidates sorted by
 /// relative path (ids stay deterministic regardless of traversal order).
 /// Directory walks are syscall-bound — on Windows especially — so the
 /// parallel walker is the single biggest lever for refresh latency.
-pub fn collect_candidates(root: &Path, threads: usize) -> io::Result<Vec<Candidate>> {
+///
+/// Hidden files are *included* and marked, so the index covers them and a
+/// search decides (--hidden) without a rebuild. `.git` is always pruned.
+/// `no_ignore` drops the gitignore/.ignore rules (rg -u) — used only for
+/// walk-scans; the index itself always respects ignore rules.
+pub fn collect_candidates(
+    root: &Path,
+    threads: usize,
+    no_ignore: bool,
+) -> io::Result<Vec<Candidate>> {
     let (tx, rx) = mpsc::channel::<Candidate>();
-    let walker = ignore::WalkBuilder::new(root)
-        .threads(threads.max(1))
-        .build_parallel();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.threads(threads.max(1)).hidden(false);
+    if no_ignore {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+    let walker = builder.build_parallel();
     walker.run(|| {
         let tx = tx.clone();
         let root = root.to_path_buf();
@@ -111,7 +142,15 @@ pub fn collect_candidates(root: &Path, threads: usize) -> io::Result<Vec<Candida
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
+            let ft = entry.file_type();
+            if ft.as_ref().is_some_and(|t| t.is_dir()) {
+                // Never descend into .git, hidden or not.
+                if entry.file_name() == ".git" {
+                    return ignore::WalkState::Skip;
+                }
+                return ignore::WalkState::Continue;
+            }
+            if !ft.is_some_and(|t| t.is_file()) {
                 return ignore::WalkState::Continue;
             }
             let Ok(md) = entry.metadata() else {
@@ -120,12 +159,16 @@ pub fn collect_candidates(root: &Path, threads: usize) -> io::Result<Vec<Candida
             let Ok(rel) = entry.path().strip_prefix(&root) else {
                 return ignore::WalkState::Continue;
             };
+            let dotted = rel
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
             let rel_path = rel_string(rel);
             if !rel_path.is_empty() {
                 let _ = tx.send(Candidate {
                     rel_path,
                     size: md.len(),
                     mtime: mtime_nanos(&md),
+                    hidden: dotted || attr_hidden(&md),
                 });
             }
             ignore::WalkState::Continue
@@ -236,7 +279,7 @@ fn build_attempt(
     // names are unique per attempt, so nothing else ever overwrites them).
     format::sweep_stale_temps(index_path);
     format::sweep_stale_temps(&overlay_path);
-    let candidates = collect_candidates(root, opts.threads)?;
+    let candidates = collect_candidates(root, opts.threads, false)?;
     stats.files_total = candidates.len();
 
     let base = if use_existing {
@@ -279,11 +322,15 @@ fn build_attempt(
     for cand in &candidates {
         let too_large = cand.size > opts.max_file_size;
         // Unchanged (size+mtime) entries keep their stored classification
-        // (indexed/binary/large) unless the size cap moved them across the
-        // boundary. Base match is preferred so reverted files migrate back
-        // out of the overlay.
+        // (indexed/binary/large/hidden) unless the size cap or hiddenness
+        // moved them across a boundary. Base match is preferred so reverted
+        // files migrate back out of the overlay.
         if let Some(&(bid, sz, mt, bf)) = base_by_path.get(cand.rel_path.as_str()) {
-            if sz == cand.size && mt == cand.mtime && (bf & FLAG_SCAN_ALWAYS != 0) == too_large {
+            if sz == cand.size
+                && mt == cand.mtime
+                && (bf & FLAG_SCAN_ALWAYS != 0) == too_large
+                && (bf & FLAG_HIDDEN != 0) == cand.hidden
+            {
                 class.push(Class::Base(bid));
                 flags.push(bf);
                 base_alive[bid as usize] = true;
@@ -291,7 +338,11 @@ fn build_attempt(
             }
         }
         if let Some(&(oid, sz, mt, of)) = over_by_path.get(cand.rel_path.as_str()) {
-            if sz == cand.size && mt == cand.mtime && (of & FLAG_SCAN_ALWAYS != 0) == too_large {
+            if sz == cand.size
+                && mt == cand.mtime
+                && (of & FLAG_SCAN_ALWAYS != 0) == too_large
+                && (of & FLAG_HIDDEN != 0) == cand.hidden
+            {
                 class.push(Class::Over(oid));
                 flags.push(of);
                 over_kept += 1;
@@ -299,7 +350,11 @@ fn build_attempt(
             }
         }
         class.push(Class::New);
-        flags.push(if too_large { FLAG_SCAN_ALWAYS } else { 0 });
+        let mut f = if too_large { FLAG_SCAN_ALWAYS } else { 0 };
+        if cand.hidden {
+            f |= FLAG_HIDDEN;
+        }
+        flags.push(f);
         new_files += 1;
     }
     let base_kept = base_alive.iter().filter(|&&a| a).count();
@@ -354,12 +409,12 @@ fn build_attempt(
             let id = records.len() as u32;
             match class[i] {
                 Class::Base(bid) => {
-                    if flags[i] == 0 {
+                    if flags[i] & FLAG_UNINDEXED == 0 {
                         remap_base[bid as usize] = id;
                     }
                 }
                 Class::Over(oid) => {
-                    if flags[i] == 0 {
+                    if flags[i] & FLAG_UNINDEXED == 0 {
                         remap_over[oid as usize] = id;
                     }
                 }
@@ -385,7 +440,7 @@ fn build_attempt(
             match class[i] {
                 Class::Base(_) => continue,
                 Class::Over(oid) => {
-                    if flags[i] == 0 {
+                    if flags[i] & FLAG_UNINDEXED == 0 {
                         remap_over[oid as usize] = records.len() as u32;
                     }
                 }
@@ -457,8 +512,8 @@ fn build_attempt(
         for msg in rx {
             stats.bytes_read += msg.bytes;
             for id in msg.binaries {
-                records[id as usize].flags = FLAG_BINARY;
-                flags[rec2cand[id as usize]] = FLAG_BINARY;
+                records[id as usize].flags |= FLAG_BINARY;
+                flags[rec2cand[id as usize]] |= FLAG_BINARY;
             }
             if let Err(e) = acc.extend(msg.pairs) {
                 drain_err = Some(e);
@@ -502,7 +557,7 @@ fn build_attempt(
 }
 
 fn fill_flag_stats(stats: &mut BuildStats, flags: &[u32]) {
-    stats.files_indexed = flags.iter().filter(|&&f| f == 0).count();
+    stats.files_indexed = flags.iter().filter(|&&f| f & FLAG_UNINDEXED == 0).count();
     stats.files_binary = flags.iter().filter(|&&f| f & FLAG_BINARY != 0).count();
     stats.files_scan_always = flags.iter().filter(|&&f| f & FLAG_SCAN_ALWAYS != 0).count();
 }
